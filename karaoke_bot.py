@@ -137,14 +137,24 @@ Rules:
             max_output_tokens=300,
         )
 
+        # ---- FIXED PARSING OF RESPONSES API ----
         text = ""
         for item in resp.output:
             if item.type == "message":
-                for content_part in item.message.content:
-                    if content_part.type == "text":
-                        text += content_part.text
+                # item is ResponseOutputMessage; text is in item.content
+                for content_part in item.content:
+                    # New Responses API: usually type == "output_text"
+                    if getattr(content_part, "type", None) in ("output_text", "text"):
+                        # content_part.text is a list of segments
+                        for segment in content_part.text:
+                            # segment has .text (the actual string)
+                            text += segment.text
 
         text = text.strip()
+        if not text:
+            print("[MicMate] OpenAI response had empty text, using fallback.")
+            return fallback
+
         # Sometimes models wrap JSON in ```json ... ```
         if text.startswith("```"):
             text = text.strip("`")
@@ -211,6 +221,7 @@ Rules:
         # Log full error to Railway logs, but never break the game
         print("[MicMate] Error generating song round, using fallback:", repr(e))
         return fallback
+
 
 # ------------- HELPERS -------------
 
