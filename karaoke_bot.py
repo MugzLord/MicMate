@@ -71,17 +71,31 @@ streak_by_channel: Dict[int, int] = {}
 
 
 # ------------- OPENAI HELPERS -------------
-
 async def generate_song_round(genre: Optional[str]) -> Dict:
     """
-    Uses OpenAI to generate a song round:
-    - song_title
-    - artist
-    - lyric_hints (up to 3 very short lines)
-    - clue (descriptive)
-    - acceptable_title_answers
-    - acceptable_artist_answers
+    Uses OpenAI to generate a song round.
+    If anything goes wrong (API error, JSON issue, etc),
+    it falls back to a safe static song so the game still works.
     """
+    # fallback if OpenAI misbehaves
+    fallback = {
+        "song_title": "Imagine",
+        "artist": "John Lennon",
+        "lyric_hints": [
+            "You may say I'm a dreamer",
+            "But I'm not the only one",
+        ],
+        "clue": "Iconic peace anthem from the early 1970s.",
+        "acceptable_title_answers": [
+            "imagine",
+            "imagine - john lennon",
+            "imagine john lennon",
+        ],
+        "acceptable_artist_answers": [
+            "john lennon",
+            "lennon",
+        ],
+    }
 
     genre_text = f" in the {genre} genre" if genre else ""
 
@@ -115,85 +129,88 @@ Rules:
 - Do not include any explanation or text outside the JSON object.
 """
 
-    resp = client_oa.responses.create(
-        model=OPENAI_MODEL,
-        input=[{"role": "user", "content": prompt}],
-        temperature=0.9,
-        max_output_tokens=300,
-    )
-
-    text = ""
-    for item in resp.output:
-        if item.type == "message":
-            for content_part in item.message.content:
-                if content_part.type == "text":
-                    text += content_part.text
-
-    # Try to extract JSON
-    text = text.strip()
-    # Sometimes models wrap JSON in ```json ... ```
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
-
     try:
+        resp = client_oa.responses.create(
+            model=OPENAI_MODEL,
+            input=[{"role": "user", "content": prompt}],
+            temperature=0.9,
+            max_output_tokens=300,
+        )
+
+        text = ""
+        for item in resp.output:
+            if item.type == "message":
+                for content_part in item.message.content:
+                    if content_part.type == "text":
+                        text += content_part.text
+
+        text = text.strip()
+        # Sometimes models wrap JSON in ```json ... ```
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:].strip()
+
         data = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"OpenAI returned invalid JSON: {text[:200]}") from e
 
-    song_title = str(data.get("song_title", "")).strip()
-    artist = str(data.get("artist", "")).strip()
-    lyric_hints = data.get("lyric_hints") or []
-    clue = str(data.get("clue", "")).strip()
-    acc_title = data.get("acceptable_title_answers") or []
-    acc_artist = data.get("acceptable_artist_answers") or []
+        song_title = str(data.get("song_title", "")).strip()
+        artist = str(data.get("artist", "")).strip()
+        lyric_hints = data.get("lyric_hints") or []
+        clue = str(data.get("clue", "")).strip()
+        acc_title = data.get("acceptable_title_answers") or []
+        acc_artist = data.get("acceptable_artist_answers") or []
 
-    if not isinstance(lyric_hints, list):
-        lyric_hints = [str(lyric_hints)]
+        if not isinstance(lyric_hints, list):
+            lyric_hints = [str(lyric_hints)]
 
-    if not isinstance(acc_title, list):
-        acc_title = [str(acc_title)]
-    if not isinstance(acc_artist, list):
-        acc_artist = [str(acc_artist)]
+        if not isinstance(acc_title, list):
+            acc_title = [str(acc_title)]
+        if not isinstance(acc_artist, list):
+            acc_artist = [str(acc_artist)]
 
-    def normalise_list(str_list: List) -> List[str]:
-        out = []
-        for x in str_list:
-            s = str(x).strip()
-            if s:
-                out.append(s)
-        return out
+        def normalise_list(str_list: List) -> List[str]:
+            out = []
+            for x in str_list:
+                s = str(x).strip()
+                if s:
+                    out.append(s)
+            return out
 
-    # keep max 3 hints, each ≤8 words, total chars ≤90
-    lyric_hints = normalise_list(lyric_hints)[:3]
-    safe_hints: List[str] = []
-    total_chars = 0
-    for hint in lyric_hints:
-        words = hint.split()
-        hint_short = " ".join(words[:8])
-        if len(hint_short) > 90:
-            hint_short = hint_short[:90]
-        total_chars += len(hint_short)
-        if total_chars > 90:
-            break
-        safe_hints.append(hint_short)
+        # keep max 3 hints, each ≤8 words, total chars ≤90
+        lyric_hints = normalise_list(lyric_hints)[:3]
+        safe_hints: List[str] = []
+        total_chars = 0
+        for hint in lyric_hints:
+            words = hint.split()
+            hint_short = " ".join(words[:8])
+            if len(hint_short) > 90:
+                hint_short = hint_short[:90]
+            total_chars += len(hint_short)
+            if total_chars > 90:
+                break
+            safe_hints.append(hint_short)
 
-    acc_title = [s.lower().strip() for s in normalise_list(acc_title)]
-    acc_artist = [s.lower().strip() for s in normalise_list(acc_artist)]
+        acc_title = [s.lower().strip() for s in normalise_list(acc_title)]
+        acc_artist = [s.lower().strip() for s in normalise_list(acc_artist)]
 
-    if not song_title or not clue:
-        raise RuntimeError("OpenAI response missing song_title or clue")
+        # sanity check – if OpenAI responds weirdly, use fallback
+        if not song_title or not clue:
+            print("[MicMate] OpenAI response missing song_title or clue, using fallback.")
+            return fallback
 
-    return {
-        "song_title": song_title,
-        "artist": artist or "Unknown",
-        "lyric_hints": safe_hints,
-        "clue": clue,
-        "acceptable_title_answers": acc_title,
-        "acceptable_artist_answers": acc_artist,
-    }
+        return {
+            "song_title": song_title,
+            "artist": artist or "Unknown",
+            "lyric_hints": safe_hints,
+            "clue": clue,
+            "acceptable_title_answers": acc_title,
+            "acceptable_artist_answers": acc_artist,
+        }
 
+    except Exception as e:
+        # Log full error to Railway logs, but never break the game
+        print("[MicMate] Error generating song round, using fallback:", repr(e))
+        return fallback
 
 # ------------- HELPERS -------------
 
