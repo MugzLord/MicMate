@@ -638,7 +638,6 @@ async def mic_slash(
 
     bot.loop.create_task(run_mic_game(channel, total_levels))
 
-
 @bot.command(name="mic")
 async def mic_prefix(ctx: commands.Context, rounds: Optional[int] = None):
     channel = ctx.channel
