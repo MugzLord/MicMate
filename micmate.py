@@ -247,12 +247,13 @@ async def play_single_level(
             song = candidate
 
     except Exception as e:
-        print("[MicMate] Fatal error getting song from OpenAI:", repr(e))
+        print("[MicMate] Fatal error getting song:", repr(e))
         await channel.send(
-            "⚠️ I couldn't get a new song from OpenAI. "
-            "Mic game has been stopped. Try `/mic` again in a bit."
+            "⚠️ I couldn't load a new song just now, "
+            "so this Mic game has been stopped. Try `/mic` again in a bit."
         )
         return None, None
+
 
     lyrics_block = "\n".join(f"• “{line}”" for line in song.lyric_lines)
     desc = (
