@@ -21,8 +21,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY env var not set")
 
+# Same model/key setup as MugOff
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-
 client_oa = OpenAI(api_key=OPENAI_API_KEY)
 
 ROUND_TIME = 60   # seconds to guess
@@ -84,38 +84,37 @@ def is_correct_guess(song: SongRound, guess: str) -> bool:
     return False
 
 
-# ------------- OPENAI -------------
+# ------------- OPENAI (NO FALLBACK) -------------
 
-async def generate_song_round() -> SongRound:
+async def generate_song_round(last_song: Optional[SongRound] = None) -> SongRound:
     """
     Ask OpenAI for a song with 1–3 short lyric lines and acceptable answers.
-    If anything fails, return a safe fallback.
+    NO local fallback – if this fails, caller should stop the game.
     """
-    fallback = SongRound(
-        song_title="Imagine",
-        artist="John Lennon",
-        lyric_lines=[
-            "You may say I'm a dreamer",
-            "But I'm not the only one",
-        ],
-        acceptable_titles=["imagine", "imagine - john lennon", "imagine john lennon"],
-        acceptable_artists=["john lennon", "lennon"],
-    )
+    avoid_text = """
+You MUST NOT choose "Shape of You" by Ed Sheeran for this game.
+"""
+    if last_song is not None:
+        avoid_text += f"""
+The previous round used: "{last_song.song_title}" by {last_song.artist}.
+You MUST NOT choose that same song again this round.
+"""
 
-    prompt = """
+    prompt = f"""
 You are powering a Discord “guess the song” game using lyrics.
 
-Pick a well-known, globally recognisable song.
+Pick a well-known, globally recognisable song that many people are likely to know.
+{avoid_text}
 
 Return ONLY a compact JSON object with this exact structure:
 
-{
+{{
   "song_title": "...",
   "artist": "...",
   "lyric_lines": ["...", "...", "..."],
   "acceptable_title_answers": ["...", "..."],
   "acceptable_artist_answers": ["...", "..."]
-}
+}}
 
 Rules:
 - "lyric_lines" must contain 1 to 3 very short lyric-style lines:
@@ -130,76 +129,76 @@ Rules:
 - Do not include any explanation or text outside the JSON object.
 """
 
+    # Use the same style as MugOff (chat.completions)
+    resp = client_oa.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.9,
+        max_tokens=400,
+    )
+
+    text = (resp.choices[0].message.content or "").strip()
+
+    # Strip ```json ... ``` wrapper if present
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+
     try:
-        resp = client_oa.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.9,
-            max_tokens=400,
-        )
-
-        text = (resp.choices[0].message.content or "").strip()
-
-        # Strip ```json ... ``` wrapper if present
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lower().startswith("json"):
-                text = text[4:].strip()
-
         data = json.loads(text)
+    except json.JSONDecodeError as e:
+        print("[MicMate] OpenAI returned invalid JSON:", repr(e), "raw:", text[:200])
+        raise
 
-        song_title = str(data.get("song_title", "")).strip()
-        artist = str(data.get("artist", "")).strip()
-        lyric_lines = data.get("lyric_lines") or []
-        acc_title = data.get("acceptable_title_answers") or []
-        acc_artist = data.get("acceptable_artist_answers") or []
+    song_title = str(data.get("song_title", "")).strip()
+    artist = str(data.get("artist", "")).strip()
+    lyric_lines = data.get("lyric_lines") or []
+    acc_title = data.get("acceptable_title_answers") or []
+    acc_artist = data.get("acceptable_artist_answers") or []
 
-        if not isinstance(lyric_lines, list):
-            lyric_lines = [str(lyric_lines)]
-        if not isinstance(acc_title, list):
-            acc_title = [str(acc_title)]
-        if not isinstance(acc_artist, list):
-            acc_artist = [str(acc_artist)]
+    if not isinstance(lyric_lines, list):
+        lyric_lines = [str(lyric_lines)]
+    if not isinstance(acc_title, list):
+        acc_title = [str(acc_title)]
+    if not isinstance(acc_artist, list):
+        acc_artist = [str(acc_artist)]
 
-        def norm_list(values: List) -> List[str]:
-            out: List[str] = []
-            for v in values:
-                s = str(v).strip()
-                if s:
-                    out.append(s)
-            return out
+    def norm_list(values: List) -> List[str]:
+        out: List[str] = []
+        for v in values:
+            s = str(v).strip()
+            if s:
+                out.append(s)
+        return out
 
-        lyric_lines = norm_list(lyric_lines)[:3]
-        safe_lines: List[str] = []
-        total_chars = 0
-        for line in lyric_lines:
-            words = line.split()
-            line_short = " ".join(words[:8])
-            if len(line_short) > 90:
-                line_short = line_short[:90]
-            total_chars += len(line_short)
-            if total_chars > 90:
-                break
-            safe_lines.append(line_short)
+    lyric_lines = norm_list(lyric_lines)[:3]
+    safe_lines: List[str] = []
+    total_chars = 0
+    for line in lyric_lines:
+        words = line.split()
+        line_short = " ".join(words[:8])
+        if len(line_short) > 90:
+            line_short = line_short[:90]
+        total_chars += len(line_short)
+        if total_chars > 90:
+            break
+        safe_lines.append(line_short)
 
-        acc_title = [s.lower().strip() for s in norm_list(acc_title)]
-        acc_artist = [s.lower().strip() for s in norm_list(acc_artist)]
+    acc_title = [_norm(s) for s in norm_list(acc_title)]
+    acc_artist = [_norm(s) for s in norm_list(acc_artist)]
 
-        if not song_title or not safe_lines:
-            print("[MicMate] Missing title or lyric_lines, using fallback.")
-            return fallback
+    if not song_title or not safe_lines:
+        print("[MicMate] OpenAI response missing title/lyrics. Raw:", text[:200])
+        raise RuntimeError("OpenAI response missing song_title or lyric_lines")
 
-        return SongRound(
-            song_title=song_title,
-            artist=artist or "Unknown",
-            lyric_lines=safe_lines,
-            acceptable_titles=acc_title,
-            acceptable_artists=acc_artist,
-        )
-
-    except Exception as e:
-        print("[MicMate] Error from OpenAI, using fallback:", repr(e))
-        return fallback
+    return SongRound(
+        song_title=song_title,
+        artist=artist or "Unknown",
+        lyric_lines=safe_lines,
+        acceptable_titles=acc_title,
+        acceptable_artists=acc_artist,
+    )
 
 
 # ------------- GAME LOGIC -------------
@@ -210,35 +209,50 @@ async def play_single_level(
     total_levels: int,
     scores: Dict[int, int],
     last_song: Optional[SongRound] = None,
-) -> Tuple[Optional[int], SongRound]:
+) -> Tuple[Optional[int], Optional[SongRound]]:
     """
     Runs one level:
-    - gets a song (tries to avoid repeating last round)
+    - gets a song (asks OpenAI, tries to avoid repeating last round)
     - sends lyrics embed
     - waits up to ROUND_TIME for a correct guess
     - reacts with 🎤 on the winning message
     - sends Answer / Time's up embed
-    Returns (winner_id or None, song).
+
+    Returns (winner_id or None, song or None).
+    If song is None, it means OpenAI failed and caller should stop.
     """
 
-    # Try a few times to get a different song than last round
-    attempts = 0
-    while True:
-        song = await generate_song_round()
-        attempts += 1
+    # Try up to 5 times to get a different song than last round.
+    # All attempts are still via OpenAI; no local fallback.
+    song: Optional[SongRound] = None
+    try:
+        attempts = 0
+        while attempts < 5:
+            candidate = await generate_song_round(last_song)
+            attempts += 1
 
-        if last_song is None:
-            break
+            if last_song is None:
+                song = candidate
+                break
 
-        same_title = _norm(song.song_title) == _norm(last_song.song_title)
-        same_artist = _norm(song.artist) == _norm(last_song.artist)
+            same_title = _norm(candidate.song_title) == _norm(last_song.song_title)
+            same_artist = _norm(candidate.artist) == _norm(last_song.artist)
 
-        if not (same_title and same_artist):
-            break  # different song
+            if not (same_title and same_artist):
+                song = candidate
+                break
 
-        if attempts >= 5:
-            print("[MicMate] Same song returned multiple times, using it anyway.")
-            break
+        if song is None:
+            # even after 5 attempts we only got the same thing
+            song = candidate
+
+    except Exception as e:
+        print("[MicMate] Fatal error getting song from OpenAI:", repr(e))
+        await channel.send(
+            "⚠️ I couldn't get a new song from OpenAI. "
+            "Mic game has been stopped. Try `/mic` again in a bit."
+        )
+        return None, None
 
     lyrics_block = "\n".join(f"• “{line}”" for line in song.lyric_lines)
     desc = (
@@ -387,6 +401,11 @@ async def run_mic_game(
                 scores,
                 last_song=last_song,
             )
+
+            # If OpenAI failed completely, this_song will be None – stop here
+            if this_song is None:
+                break
+
             last_song = this_song
 
             # If no winner → stop the whole game here
