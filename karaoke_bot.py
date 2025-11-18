@@ -130,30 +130,15 @@ Rules:
 """
 
     try:
-        resp = client_oa.responses.create(
+        # Use chat.completions like MugOff does
+        resp = client_oa.chat.completions.create(
             model=OPENAI_MODEL,
-            input=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.9,
-            max_output_tokens=300,
+            max_tokens=400,
         )
 
-        # ---- FIXED PARSING OF RESPONSES API ----
-        text = ""
-        for item in resp.output:
-            if item.type == "message":
-                # item is ResponseOutputMessage; text is in item.content
-                for content_part in item.content:
-                    # New Responses API: usually type == "output_text"
-                    if getattr(content_part, "type", None) in ("output_text", "text"):
-                        # content_part.text is a list of segments
-                        for segment in content_part.text:
-                            # segment has .text (the actual string)
-                            text += segment.text
-
-        text = text.strip()
-        if not text:
-            print("[MicMate] OpenAI response had empty text, using fallback.")
-            return fallback
+        text = (resp.choices[0].message.content or "").strip()
 
         # Sometimes models wrap JSON in ```json ... ```
         if text.startswith("```"):
@@ -172,7 +157,6 @@ Rules:
 
         if not isinstance(lyric_hints, list):
             lyric_hints = [str(lyric_hints)]
-
         if not isinstance(acc_title, list):
             acc_title = [str(acc_title)]
         if not isinstance(acc_artist, list):
@@ -218,10 +202,8 @@ Rules:
         }
 
     except Exception as e:
-        # Log full error to Railway logs, but never break the game
         print("[MicMate] Error generating song round, using fallback:", repr(e))
         return fallback
-
 
 # ------------- HELPERS -------------
 
@@ -634,6 +616,8 @@ async def mic_command(
 
     ends_at = datetime.now(timezone.utc) + timedelta(seconds=ANSWER_TIME_LIMIT)
 
+    initial_hints_used = 1 if lyric_hints else 0
+
     round_obj = KaraokeRound(
         channel_id=channel.id,
         message_id=0,  # set after send
@@ -648,9 +632,10 @@ async def mic_command(
         ends_at=ends_at,
         winner_id=None,
         genre=genre,
-        hints_used=0,
+        hints_used=initial_hints_used,  # show first lyric line immediately
         passes_used=0,
     )
+
 
     emb = discord.Embed(
         title="🎤 Mic – Karaoke Guessing Game",
