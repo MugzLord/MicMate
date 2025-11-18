@@ -21,7 +21,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY env var not set")
 
-# Same model/key setup as MugOff
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 client_oa = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -52,6 +51,11 @@ class SongRound:
 # One active game per channel
 active_games: Dict[int, bool] = {}
 
+# Per-channel round info for hints / passes
+current_song: Dict[int, SongRound] = {}       # channel_id -> current SongRound
+hints_used: Dict[int, int] = {}              # channel_id -> 0..3 (per game)
+passes_used: Dict[int, int] = {}             # channel_id -> 0..3 (per game)
+
 
 # ------------- HELPERS -------------
 
@@ -67,14 +71,12 @@ def is_correct_guess(song: SongRound, guess: str) -> bool:
     title_norm = _norm(song.song_title)
     artist_norm = _norm(song.artist)
 
-    # Check title answers
     for ans in song.acceptable_titles:
         if g == _norm(ans):
             return True
     if title_norm and title_norm in g:
         return True
 
-    # Check artist answers
     for ans in song.acceptable_artists:
         if g == _norm(ans):
             return True
@@ -84,20 +86,20 @@ def is_correct_guess(song: SongRound, guess: str) -> bool:
     return False
 
 
-# ------------- OPENAI (NO FALLBACK) -------------
+# ------------- OPENAI -------------
 
 async def generate_song_round(last_song: Optional[SongRound] = None) -> SongRound:
     """
-    Ask OpenAI for a song with 1–3 short lyric lines and acceptable answers.
-    NO local fallback – if this fails, caller should stop the game.
+    Ask the model for a song with 1–3 short lyric lines and acceptable answers.
+    No local fallback. If this fails, caller will stop the game.
     """
     avoid_text = """
-You MUST NOT choose "Shape of You" by Ed Sheeran for this game.
+You must not choose "Shape of You" by Ed Sheeran.
 """
     if last_song is not None:
         avoid_text += f"""
 The previous round used: "{last_song.song_title}" by {last_song.artist}.
-You MUST NOT choose that same song again this round.
+You must not choose that same song again this round.
 """
 
     prompt = f"""
@@ -118,9 +120,9 @@ Return ONLY a compact JSON object with this exact structure:
 
 Rules:
 - "lyric_lines" must contain 1 to 3 very short lyric-style lines:
-  - Each line MUST be 8 words or fewer.
-  - The TOTAL characters across all lines MUST stay safely under 90 characters.
-  - Do NOT output full verses or long passages.
+  - Each line must be 8 words or fewer.
+  - The total characters across all lines must stay safely under 90 characters.
+  - Do not output full verses or long passages.
 - It is OK if lines resemble real lyrics, as long as they stay under the above limits.
 - In "acceptable_title_answers":
   - include sensible variations of the song title (title alone, title + artist, common short forms).
@@ -129,7 +131,6 @@ Rules:
 - Do not include any explanation or text outside the JSON object.
 """
 
-    # Use the same style as MugOff (chat.completions)
     resp = client_oa.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[{"role": "user", "content": prompt}],
@@ -139,7 +140,6 @@ Rules:
 
     text = (resp.choices[0].message.content or "").strip()
 
-    # Strip ```json ... ``` wrapper if present
     if text.startswith("```"):
         text = text.strip("`")
         if text.lower().startswith("json"):
@@ -148,7 +148,7 @@ Rules:
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
-        print("[MicMate] OpenAI returned invalid JSON:", repr(e), "raw:", text[:200])
+        print("[MicMate] Invalid JSON from model:", repr(e), "raw:", text[:200])
         raise
 
     song_title = str(data.get("song_title", "")).strip()
@@ -189,8 +189,8 @@ Rules:
     acc_artist = [_norm(s) for s in norm_list(acc_artist)]
 
     if not song_title or not safe_lines:
-        print("[MicMate] OpenAI response missing title/lyrics. Raw:", text[:200])
-        raise RuntimeError("OpenAI response missing song_title or lyric_lines")
+        print("[MicMate] Missing title/lyrics. Raw:", text[:200])
+        raise RuntimeError("Model response missing song_title or lyric_lines")
 
     return SongRound(
         song_title=song_title,
@@ -209,42 +209,51 @@ async def play_single_level(
     total_levels: int,
     scores: Dict[int, int],
     last_song: Optional[SongRound] = None,
-) -> Tuple[Optional[int], Optional[SongRound]]:
+    used_titles: Optional[set] = None,
+) -> Tuple[Optional[int], Optional[SongRound], bool]:
     """
-    Runs one level:
-    - gets a song (asks OpenAI, tries to avoid repeating last round)
-    - sends lyrics embed
-    - waits up to ROUND_TIME for a correct guess
-    - reacts with 🎤 on the winning message
-    - sends Answer / Time's up embed
+    Runs one level and returns (winner_id, song, passed_flag).
 
-    Returns (winner_id or None, song or None).
-    If song is None, it means OpenAI failed and caller should stop.
+    winner_id:
+      - user id if someone guessed correctly
+      - None if no one guessed / pass / error
+
+    song:
+      - SongRound object, or None if model failed
+
+    passed_flag:
+      - True if the round was skipped via pass
+      - False otherwise
     """
 
-    # Try up to 5 times to get a different song than last round.
-    # All attempts are still via OpenAI; no local fallback.
+    # Get a song, trying a few times to avoid any already-used title
     song: Optional[SongRound] = None
+    passed_flag = False
+
+    if used_titles is None:
+        used_titles = set()
+
     try:
         attempts = 0
-        while attempts < 5:
+        last_title_norm = _norm(last_song.song_title) if last_song else None
+
+        while attempts < 10:  # a few extra tries
             candidate = await generate_song_round(last_song)
             attempts += 1
 
-            if last_song is None:
-                song = candidate
-                break
+            title_key = _norm(candidate.song_title)
+            same_as_last = last_title_norm and title_key == last_title_norm
+            seen_before = title_key in used_titles
 
-            same_title = _norm(candidate.song_title) == _norm(last_song.song_title)
-            same_artist = _norm(candidate.artist) == _norm(last_song.artist)
-
-            if not (same_title and same_artist):
+            if not same_as_last and not seen_before:
                 song = candidate
                 break
 
         if song is None:
-            # even after 5 attempts we only got the same thing
+            # even after retries, just take the last candidate
             song = candidate
+
+
 
     except Exception as e:
         print("[MicMate] Fatal error getting song:", repr(e))
@@ -252,8 +261,10 @@ async def play_single_level(
             "⚠️ I couldn't load a new song just now, "
             "so this Mic game has been stopped. Try `/mic` again in a bit."
         )
-        return None, None
+        return None, None, False
 
+    # Register current song for hints/passes
+    current_song[channel.id] = song
 
     lyrics_block = "\n".join(f"• “{line}”" for line in song.lyric_lines)
     desc = (
@@ -271,7 +282,6 @@ async def play_single_level(
 
     await channel.send(embed=embed)
 
-    # Wait for guesses
     winner_id: Optional[int] = None
     winner_msg: Optional[discord.Message] = None
     ends_at = datetime.now(timezone.utc) + timedelta(seconds=ROUND_TIME)
@@ -293,12 +303,31 @@ async def play_single_level(
         except asyncio.TimeoutError:
             break
 
+        content = msg.content.lower().strip()
+
+        # Handle pass via plain message "m.pass"
+        if content.startswith("m.pass"):
+            used = passes_used.get(channel.id, 0)
+            if used >= 3:
+                await channel.send(
+                    "🚫 No passes left for this Mic game (3/3 used)."
+                )
+                continue
+            passes_used[channel.id] = used + 1
+            passed_flag = True
+            await channel.send(
+                f"⏭️ Song skipped with a pass ({passes_used[channel.id]}/3 used). "
+                "Next level will start shortly."
+            )
+            break
+
+        # Normal guess
         if is_correct_guess(song, msg.content):
             winner_id = msg.author.id
             winner_msg = msg
             break
 
-    # Winner vs no-winner embeds
+    # Outcome messages
     if winner_id is not None and winner_msg is not None:
         try:
             await winner_msg.add_reaction("🎤")
@@ -319,7 +348,21 @@ async def play_single_level(
 
         scores[winner_id] = scores.get(winner_id, 0) + 1
 
+    elif passed_flag:
+        # Song was skipped by pass
+        answer_embed = discord.Embed(
+            title="⏭️ Song skipped!",
+            description=(
+                f"The round was passed ({passes_used.get(channel.id, 0)}/3 used).\n"
+                "Next song will load in a moment."
+            ),
+            color=discord.Color.blurple(),
+        )
+        answer_embed.set_footer(text="Round skipped. Moving to the next level.")
+        await channel.send(embed=answer_embed)
+
     else:
+        # Time's up, no winner and no pass → game over
         answer_embed = discord.Embed(
             title="⏰ Time's up!",
             description=(
@@ -333,7 +376,7 @@ async def play_single_level(
         answer_embed.set_footer(text="Round failed. Mic session ended.")
         await channel.send(embed=answer_embed)
 
-    return winner_id, song
+    return winner_id, song, passed_flag
 
 
 async def show_ranking(
@@ -343,7 +386,6 @@ async def show_ranking(
     total_levels: int,
     final: bool = False,
 ):
-    """Show Team Ranking embed (no level x/total, only level x)."""
     embed = discord.Embed(
         title="🏆 Team Ranking",
         color=discord.Color.gold(),
@@ -384,30 +426,40 @@ async def run_mic_game(
     scores: Dict[int, int] = {}
     last_song: Optional[SongRound] = None
 
-    await channel.send("🎮 **Karaoke game starting!**")
+    # 👉 add this line
+    used_titles: set[str] = set()
 
+    # reset per-game counters
+    hints_used[channel.id] = 0
+    passes_used[channel.id] = 0
+    current_song.pop(channel.id, None)
+
+    await channel.send("🎮 **Mic game starting!**")
 
     try:
         for level in range(1, total_levels + 1):
             if not active_games.get(channel.id, False):
                 break
 
-            winner_id, this_song = await play_single_level(
+            # 👇 pass used_titles into play_single_level
+            winner_id, this_song, passed_flag = await play_single_level(
                 channel,
                 level,
                 total_levels,
                 scores,
                 last_song=last_song,
+                used_titles=used_titles,
             )
 
-            # If OpenAI failed completely, this_song will be None – stop here
             if this_song is None:
+                # error already messaged in channel
                 break
 
             last_song = this_song
+            used_titles.add(_norm(this_song.song_title))
 
-            # If no winner → stop the whole game here
-            if winner_id is None:
+            # Time up with no winner and no pass -> final ranking + stop
+            if winner_id is None and not passed_flag:
                 await show_ranking(
                     channel,
                     scores,
@@ -417,7 +469,7 @@ async def run_mic_game(
                 )
                 break
 
-            # Winner path → continue
+            # Winner or pass -> continue
             await asyncio.sleep(BREAK_TIME)
 
             final_round = (level == total_levels)
@@ -434,9 +486,103 @@ async def run_mic_game(
 
     except Exception as e:
         print("[MicMate] Unexpected error in run_mic_game:", repr(e))
-        await channel.send("⚠️ Mic ran into an error and had to stop this game.")
+        await channel.send("⚠️ Something went wrong and this Mic game had to stop.")
     finally:
         active_games.pop(channel.id, None)
+        current_song.pop(channel.id, None)
+        hints_used.pop(channel.id, None)
+        passes_used.pop(channel.id, None)
+
+
+# ------------- HINT & PASS COMMANDS -------------
+
+async def use_hint(channel: discord.TextChannel, user: discord.abc.User):
+    if not active_games.get(channel.id, False):
+        await channel.send("There is no active Mic game in this channel.")
+        return
+
+    song = current_song.get(channel.id)
+    if song is None:
+        await channel.send("There is no active round to use a hint on.")
+        return
+
+    used = hints_used.get(channel.id, 0)
+    if used >= 3:
+        await channel.send("🚫 No hints left for this Mic game (3/3 used).")
+        return
+
+    hints_used[channel.id] = used + 1
+    idx = used  # 0-based
+
+    # Hint order: lyric 1, lyric 2 (if exists), then title-start hint
+    if idx < len(song.lyric_lines):
+        line = song.lyric_lines[idx]
+        text = f"Hint {hints_used[channel.id]}/3: another lyric line – “{line}”."
+    else:
+        first_word = song.song_title.split()[0]
+        text = (
+            f"Hint {hints_used[channel.id]}/3: "
+            f"The title starts with **{first_word}**."
+        )
+
+    await channel.send(text)
+
+
+@bot.command(name="hint")
+async def hint_prefix(ctx: commands.Context):
+    await use_hint(ctx.channel, ctx.author)
+
+
+@bot.tree.command(
+    name="mic_hint",
+    description="Use one of the shared hints in the current Mic game.",
+)
+async def mic_hint_slash(interaction: discord.Interaction):
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "Use this in a normal text channel.", ephemeral=True
+        )
+        return
+    await interaction.response.send_message(
+        "Hint used.", ephemeral=True
+    )
+    await use_hint(channel, interaction.user)
+
+
+@bot.tree.command(
+    name="mic_pass",
+    description="Use one of the shared passes to skip the current song.",
+)
+async def mic_pass_slash(interaction: discord.Interaction):
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "Use this in a normal text channel.", ephemeral=True
+        )
+        return
+
+    if not active_games.get(channel.id, False):
+        await interaction.response.send_message(
+            "There is no active Mic game in this channel.",
+            ephemeral=True,
+        )
+        return
+
+    used = passes_used.get(channel.id, 0)
+    if used >= 3:
+        await interaction.response.send_message(
+            "No passes left for this Mic game (3/3 used).",
+            ephemeral=True,
+        )
+        return
+
+    # We don't skip here directly; we send a synthetic "m.pass" message
+    # so play_single_level sees it and handles the pass logic.
+    await interaction.response.send_message(
+        "Pass used. Skipping this song…", ephemeral=True
+    )
+    await channel.send("m.pass")  # triggers pass handling inside play_single_level
 
 
 # ------------- EVENTS -------------
@@ -451,11 +597,11 @@ async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 
-# ------------- SLASH COMMAND -------------
+# ------------- SLASH / PREFIX START -------------
 
 @bot.tree.command(
     name="mic",
-    description="Start a Mic lyrics guessing game (multiple levels)."
+    description="Start a Mic lyrics guessing game (like Gartic, multiple levels)."
 )
 @app_commands.describe(
     rounds=f"How many levels to play (default {DEFAULT_ROUNDS})"
@@ -493,11 +639,8 @@ async def mic_slash(
     bot.loop.create_task(run_mic_game(channel, total_levels))
 
 
-# ------------- PREFIX COMMAND -------------
-
 @bot.command(name="mic")
 async def mic_prefix(ctx: commands.Context, rounds: Optional[int] = None):
-    """Prefix version: m.mic [rounds]"""
     channel = ctx.channel
     if not isinstance(channel, discord.TextChannel):
         await ctx.reply(
