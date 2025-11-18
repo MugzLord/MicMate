@@ -552,8 +552,7 @@ async def on_ready():
 
 
 # ------------- SLASH COMMANDS -------------
-
-@bot.tree.command(name="mic", description="Start a 60-second karaoke guessing game in this channel.")
+@bot.tree.command(name="mic", description="Start a 60-second karaoke guessing round in this channel.")
 @app_commands.describe(
     mode="What are players guessing?",
     genre="Optional: pick a genre like pop, rock, kpop, rnb, etc."
@@ -638,7 +637,6 @@ async def mic_command(
     round_obj.message_id = msg.id
 
     bot.loop.create_task(run_karaoke_round(round_obj, channel, msg))
-
 
 @bot.tree.command(
     name="mic_hint",
@@ -782,6 +780,80 @@ async def m_hint(ctx: commands.Context):
     await channel.send(
         f"💡 A hint has been used! (`{round_obj.hints_used}/3`) Check the mic embed for updated hints."
     )
+@bot.command(name="mic")
+async def mic_prefix(
+    ctx: commands.Context,
+    mode: str = "either",
+    *,  # everything after this is treated as one string
+    genre: Optional[str] = None
+):
+    """Prefix version: m.mic [mode] [genre]"""
+    channel = ctx.channel
+    if not isinstance(channel, discord.TextChannel):
+        await ctx.reply("Please use this in a normal text channel.", mention_author=False)
+        return
+
+    if channel.id in active_rounds and active_rounds[channel.id].is_active:
+        await ctx.reply(
+            "There is already a mic round running in this channel. Wait for it to finish first.",
+            mention_author=False
+        )
+        return
+
+    mode_value = mode.lower()
+    if mode_value not in ("title", "artist", "either"):
+        mode_value = "either"
+
+    try:
+        song_data = await generate_song_round(genre)
+    except Exception as e:
+        print(f"Error generating song round (prefix mic): {e}")
+        await ctx.reply(
+            "I couldn't generate a new song round just now. Please try again in a moment.",
+            mention_author=False
+        )
+        return
+
+    song_title = song_data["song_title"]
+    artist = song_data["artist"]
+    lyric_hints = song_data.get("lyric_hints") or []
+    clue = song_data["clue"]
+    acc_title = song_data.get("acceptable_title_answers") or []
+    acc_artist = song_data.get("acceptable_artist_answers") or []
+
+    ends_at = datetime.now(timezone.utc) + timedelta(seconds=ANSWER_TIME_LIMIT)
+
+    round_obj = KaraokeRound(
+        channel_id=channel.id,
+        message_id=0,
+        song_title=song_title,
+        artist=artist,
+        lyric_hints=lyric_hints,
+        acceptable_title_answers=acc_title,
+        acceptable_artist_answers=acc_artist,
+        clue=clue,
+        mode=mode_value,
+        is_active=True,
+        ends_at=ends_at,
+        winner_id=None,
+        genre=genre,
+        hints_used=0,
+        passes_used=0,
+    )
+
+    emb = discord.Embed(
+        title="🎤 Mic – Karaoke Guessing Game",
+        description=build_round_description(round_obj),
+        color=discord.Color.blurple()
+    )
+    if genre:
+        emb.add_field(name="Genre", value=genre, inline=True)
+    emb.set_footer(text=f"⏱ Time left: {ANSWER_TIME_LIMIT}s")
+
+    msg = await ctx.send(embed=emb)
+    round_obj.message_id = msg.id
+
+    bot.loop.create_task(run_karaoke_round(round_obj, channel, msg))
 
 
 @bot.command(name="pass")
