@@ -1,13 +1,13 @@
 import os
 import asyncio
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import discord
-from discord import app_commands
 from discord.ext import commands
+from discord import app_commands
 
 from openai import OpenAI
 
@@ -21,15 +21,17 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY env var not set")
 
-client_oa = OpenAI(api_key=OPENAI_API_KEY)
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-ANSWER_TIME_LIMIT = 60  # seconds
+client_oa = OpenAI(api_key=OPENAI_API_KEY)
+
+ROUND_TIME = 60   # seconds to guess
+BREAK_TIME = 15   # seconds between rounds
+DEFAULT_ROUNDS = 10  # levels per /mic session
 
 intents = discord.Intents.default()
-intents.message_content = True  # needed to read answers
+intents.message_content = True
 
-# Allow both "!" and "m." prefixes, plus mention
 bot = commands.Bot(
     command_prefix=commands.when_mentioned_or("!", "m."),
     intents=intents
@@ -39,89 +41,64 @@ bot = commands.Bot(
 # ------------- STATE -------------
 
 @dataclass
-class KaraokeRound:
-    channel_id: int
-    message_id: int
+class SongRound:
     song_title: str
     artist: str
-    lyric_hints: List[str] = field(default_factory=list)
-    acceptable_title_answers: List[str] = field(default_factory=list)
-    acceptable_artist_answers: List[str] = field(default_factory=list)
-    clue: str = ""
-    mode: str = "either"  # "title", "artist", "either"
-    is_active: bool = True
-    ends_at: datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc)
-        + timedelta(seconds=ANSWER_TIME_LIMIT)
-    )
-    winner_id: Optional[int] = None
-    genre: Optional[str] = None
-    hints_used: int = 0        # shared per game
-    passes_used: int = 0       # shared per game
+    lyric_lines: List[str]
+    acceptable_titles: List[str]
+    acceptable_artists: List[str]
 
 
-# one active round per channel
-active_rounds: Dict[int, KaraokeRound] = {}
-
-# per-channel scoreboard: {channel_id: {user_id: score}}
-scores_by_channel: Dict[int, Dict[int, int]] = {}
-
-# per-channel solved streak: how many songs in a row were guessed correctly
-streak_by_channel: Dict[int, int] = {}
+# per-channel flag to avoid multiple games in same channel
+active_games: Dict[int, bool] = {}
 
 
 # ------------- OPENAI HELPERS -------------
-async def generate_song_round(genre: Optional[str]) -> Dict:
+
+async def generate_song_round() -> SongRound:
     """
-    Uses OpenAI to generate a song round.
-    If anything goes wrong (API error, JSON issue, etc),
-    it falls back to a safe static song so the game still works.
+    Ask OpenAI for:
+      - song_title
+      - artist
+      - lyric_lines (1-3 very short lines)
+      - acceptable_title_answers
+      - acceptable_artist_answers
+
+    If anything goes wrong, we fall back to a static song
+    so the game never breaks.
     """
-    # fallback if OpenAI misbehaves
-    fallback = {
-        "song_title": "Imagine",
-        "artist": "John Lennon",
-        "lyric_hints": [
+    fallback = SongRound(
+        song_title="Imagine",
+        artist="John Lennon",
+        lyric_lines=[
             "You may say I'm a dreamer",
             "But I'm not the only one",
         ],
-        "clue": "Iconic peace anthem from the early 1970s.",
-        "acceptable_title_answers": [
-            "imagine",
-            "imagine - john lennon",
-            "imagine john lennon",
-        ],
-        "acceptable_artist_answers": [
-            "john lennon",
-            "lennon",
-        ],
-    }
+        acceptable_titles=["imagine", "imagine - john lennon", "imagine john lennon"],
+        acceptable_artists=["john lennon", "lennon"],
+    )
 
-    genre_text = f" in the {genre} genre" if genre else ""
+    prompt = """
+You are powering a Discord “guess the song” game using lyrics.
 
-    prompt = f"""
-You are powering a Discord karaoke guessing game.
-
-Pick a well-known, globally recognisable song{genre_text}.
+Pick a well-known, globally recognisable song.
 
 Return ONLY a compact JSON object with this exact structure:
 
-{{
+{
   "song_title": "...",
   "artist": "...",
-  "lyric_hints": ["...", "...", "..."],
-  "clue": "...",
+  "lyric_lines": ["...", "...", "..."],
   "acceptable_title_answers": ["...", "..."],
   "acceptable_artist_answers": ["...", "..."]
-}}
+}
 
 Rules:
-- "lyric_hints" must contain 1 to 3 very short lyric-style hints:
-  - Each hint MUST be 8 words or fewer.
-  - The TOTAL characters across all hints MUST stay safely under 90 characters.
+- "lyric_lines" must contain 1 to 3 very short lyric-style lines:
+  - Each line MUST be 8 words or fewer.
+  - The TOTAL characters across all lines MUST stay safely under 90 characters.
   - Do NOT output full verses or long passages.
-- It is OK if hints resemble real lyrics, as long as they stay under the above limits.
-- "clue" should describe the song (theme, mood, era, scenario, style) but must NOT contain long lyric quotes.
+- It is OK if lines resemble real lyrics, as long as they stay under the above limits.
 - In "acceptable_title_answers":
   - include sensible variations of the song title (title alone, title + artist, common short forms).
 - In "acceptable_artist_answers":
@@ -130,7 +107,6 @@ Rules:
 """
 
     try:
-        # Use chat.completions like MugOff does
         resp = client_oa.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
@@ -140,7 +116,7 @@ Rules:
 
         text = (resp.choices[0].message.content or "").strip()
 
-        # Sometimes models wrap JSON in ```json ... ```
+        # Strip ```json ... ``` wrapper if present
         if text.startswith("```"):
             text = text.strip("`")
             if text.lower().startswith("json"):
@@ -150,403 +126,266 @@ Rules:
 
         song_title = str(data.get("song_title", "")).strip()
         artist = str(data.get("artist", "")).strip()
-        lyric_hints = data.get("lyric_hints") or []
-        clue = str(data.get("clue", "")).strip()
+        lyric_lines = data.get("lyric_lines") or []
         acc_title = data.get("acceptable_title_answers") or []
         acc_artist = data.get("acceptable_artist_answers") or []
 
-        if not isinstance(lyric_hints, list):
-            lyric_hints = [str(lyric_hints)]
+        if not isinstance(lyric_lines, list):
+            lyric_lines = [str(lyric_lines)]
         if not isinstance(acc_title, list):
             acc_title = [str(acc_title)]
         if not isinstance(acc_artist, list):
             acc_artist = [str(acc_artist)]
 
-        def normalise_list(str_list: List) -> List[str]:
-            out = []
-            for x in str_list:
-                s = str(x).strip()
+        def norm_list(values: List) -> List[str]:
+            out: List[str] = []
+            for v in values:
+                s = str(v).strip()
                 if s:
                     out.append(s)
             return out
 
-        # keep max 3 hints, each ≤8 words, total chars ≤90
-        lyric_hints = normalise_list(lyric_hints)[:3]
-        safe_hints: List[str] = []
+        lyric_lines = norm_list(lyric_lines)[:3]
+        safe_lines: List[str] = []
         total_chars = 0
-        for hint in lyric_hints:
-            words = hint.split()
-            hint_short = " ".join(words[:8])
-            if len(hint_short) > 90:
-                hint_short = hint_short[:90]
-            total_chars += len(hint_short)
+        for line in lyric_lines:
+            words = line.split()
+            line_short = " ".join(words[:8])
+            if len(line_short) > 90:
+                line_short = line_short[:90]
+            total_chars += len(line_short)
             if total_chars > 90:
                 break
-            safe_hints.append(hint_short)
+            safe_lines.append(line_short)
 
-        acc_title = [s.lower().strip() for s in normalise_list(acc_title)]
-        acc_artist = [s.lower().strip() for s in normalise_list(acc_artist)]
+        acc_title = [s.lower().strip() for s in norm_list(acc_title)]
+        acc_artist = [s.lower().strip() for s in norm_list(acc_artist)]
 
-        # sanity check – if OpenAI responds weirdly, use fallback
-        if not song_title or not clue:
-            print("[MicMate] OpenAI response missing song_title or clue, using fallback.")
+        if not song_title or not safe_lines:
+            print("[MicMate] Missing title or lyric_lines, using fallback.")
             return fallback
 
-        return {
-            "song_title": song_title,
-            "artist": artist or "Unknown",
-            "lyric_hints": safe_hints,
-            "clue": clue,
-            "acceptable_title_answers": acc_title,
-            "acceptable_artist_answers": acc_artist,
-        }
+        return SongRound(
+            song_title=song_title,
+            artist=artist or "Unknown",
+            lyric_lines=safe_lines,
+            acceptable_titles=acc_title,
+            acceptable_artists=acc_artist,
+        )
 
     except Exception as e:
-        print("[MicMate] Error generating song round, using fallback:", repr(e))
+        print("[MicMate] Error from OpenAI, using fallback:", repr(e))
         return fallback
 
-# ------------- HELPERS -------------
 
-def _normalise_answer(s: str) -> str:
+# ------------- GAME HELPERS -------------
+
+def _norm(s: str) -> str:
     return " ".join(s.lower().strip().split())
 
 
-def _is_correct_guess(round_obj: KaraokeRound, guess: str) -> bool:
-    """
-    Checks correctness based on round_obj.mode:
-    - "title": only title-based answers
-    - "artist": only artist-based answers
-    - "either": either title or artist counts
-    """
-    g = _normalise_answer(guess)
+def is_correct_guess(song: SongRound, guess: str) -> bool:
+    g = _norm(guess)
     if not g:
         return False
 
-    title_norm = _normalise_answer(round_obj.song_title)
-    artist_norm = _normalise_answer(round_obj.artist)
+    title_norm = _norm(song.song_title)
+    artist_norm = _norm(song.artist)
 
-    def match_any(candidates: List[str]) -> bool:
-        for ans in candidates:
-            if g == _normalise_answer(ans):
-                return True
-        return False
+    # Check title answers
+    for ans in song.acceptable_titles:
+        if g == _norm(ans):
+            return True
+    if title_norm and title_norm in g:
+        return True
 
-    def contains_term(term: str) -> bool:
-        return bool(term and term in g)
+    # Check artist answers
+    for ans in song.acceptable_artists:
+        if g == _norm(ans):
+            return True
+    if artist_norm and artist_norm in g:
+        return True
 
-    title_ok = match_any(round_obj.acceptable_title_answers) or contains_term(title_norm)
-    artist_ok = match_any(round_obj.acceptable_artist_answers) or contains_term(artist_norm)
-
-    if round_obj.mode == "title":
-        return title_ok
-    elif round_obj.mode == "artist":
-        return artist_ok
-    else:  # "either"
-        return title_ok or artist_ok
+    return False
 
 
-def build_round_description(round_obj: KaraokeRound) -> str:
-    """Builds the embed description including hints used, clue and mode."""
-    mode_text = {
-        "title": "Guess the TITLE",
-        "artist": "Guess the ARTIST",
-        "either": "Guess the TITLE or ARTIST",
-    }.get(round_obj.mode, "Guess the TITLE or ARTIST")
+async def play_single_level(
+    channel: discord.TextChannel,
+    level: int,
+    total_levels: int,
+    scores: Dict[int, int],
+) -> Tuple[Optional[int], SongRound]:
+    """
+    Runs one level:
+    - sends lyrics embed
+    - waits up to ROUND_TIME for correct guess
+    - reacts on the winning message
+    - shows "Answer guessed" or "Time's up" embed
+    Returns (winner_id or None, SongRound)
+    """
 
-    parts: List[str] = []
+    song = await generate_song_round()
 
-    if round_obj.hints_used > 0 and round_obj.lyric_hints:
-        shown_hints = round_obj.lyric_hints[: round_obj.hints_used]
-        hint_lines = [f"• “{h}”" for h in shown_hints]
-        parts.append("**Lyric hints:**\n" + "\n".join(hint_lines))
+    # Build lyrics block
+    lyrics_block = "\n".join(f"• “{line}”" for line in song.lyric_lines)
 
-    parts.append(f"**Clue:** {round_obj.clue}")
-    parts.append(
-        f"\n**Mode:** {mode_text}\n"
-        f"Guess in chat! You have **{ANSWER_TIME_LIMIT} seconds**.\n"
-        "_(Full song + artist revealed at the end.)_\n"
-        f"Hints used: `{round_obj.hints_used}/3`, Passes used: `{round_obj.passes_used}/3`"
+    desc = (
+        f"**Lyrics:**\n{lyrics_block}\n\n"
+        f"Mode: Guess the **TITLE** or **ARTIST** in chat.\n"
+        f"You have **{ROUND_TIME} seconds**."
     )
 
-    return "\n\n".join(parts)
-
-
-async def post_scoreboard(channel: discord.TextChannel):
-    """
-    Posts a scoreboard embed for the current channel.
-
-    - Scores are cumulative across games until reset.
-    - Streak (how many songs in a row were guessed correctly) is shown in the footer.
-    """
-    scores = scores_by_channel.get(channel.id, {})
-    streak = streak_by_channel.get(channel.id, 0)
-
-    emb = discord.Embed(
-        title="🎶 Mic Scoreboard",
-        color=discord.Color.gold()
+    embed = discord.Embed(
+        title=f"🎶 Mic – Level {level}/{total_levels}",
+        description=desc,
+        color=discord.Color.blurple(),
     )
+    embed.set_footer(text=f"Time left: {ROUND_TIME} seconds")
 
-    if not scores:
-        emb.description = "No scores yet. Win a round to get on the board!"
-    else:
-        sorted_scores = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
-        lines = []
+    question_msg = await channel.send(embed=embed)
 
-        top_user_id, top_score = sorted_scores[0]
-        emb.add_field(
-            name="👑 Current Top Scorer",
-            value=f"<@{top_user_id}> — `{top_score}` point(s)",
-            inline=False,
-        )
+    # Wait for guesses
+    winner_id: Optional[int] = None
+    winner_msg: Optional[discord.Message] = None
+    ends_at = datetime.now(timezone.utc) + timedelta(seconds=ROUND_TIME)
 
-        for idx, (user_id, score) in enumerate(sorted_scores, start=1):
-            lines.append(f"**{idx}.** <@{user_id}> — `{score}` point(s)")
-
-        emb.add_field(
-            name="Full Ranking",
-            value="\n".join(lines),
-            inline=False
-        )
-
-    emb.set_footer(text=f"Solved streak in this channel: {streak}")
-    await channel.send(embed=emb)
-
-
-async def start_new_song_after_pass(old_round: KaraokeRound, channel: discord.TextChannel):
-    """
-    Called when /mic_pass or m.pass is used:
-    - Keeps scores & streak
-    - Keeps hints_used & passes_used counters
-    - Loads a NEW song into the same message
-    - Starts a fresh run_karaoke_round with the new round object
-    """
-    try:
-        song_data = await generate_song_round(old_round.genre)
-    except Exception as e:
-        print(f"Error generating new song after pass: {e}")
-        await channel.send("⚠️ I couldn't load a new song right now. Try `/mic` again later.")
-        return
-
-    song_title = song_data["song_title"]
-    artist = song_data["artist"]
-    lyric_hints = song_data.get("lyric_hints") or []
-    clue = song_data["clue"]
-    acc_title = song_data.get("acceptable_title_answers") or []
-    acc_artist = song_data.get("acceptable_artist_answers") or []
-
-    ends_at = datetime.now(timezone.utc) + timedelta(seconds=ANSWER_TIME_LIMIT)
-
-    try:
-        msg = await channel.fetch_message(old_round.message_id)
-    except discord.NotFound:
-        await channel.send("⚠️ Original mic message was lost, starting a fresh game.")
-        return
-
-    new_round = KaraokeRound(
-        channel_id=channel.id,
-        message_id=msg.id,
-        song_title=song_title,
-        artist=artist,
-        lyric_hints=lyric_hints,
-        acceptable_title_answers=acc_title,
-        acceptable_artist_answers=acc_artist,
-        clue=clue,
-        mode=old_round.mode,
-        is_active=True,
-        ends_at=ends_at,
-        winner_id=None,
-        genre=old_round.genre,
-        hints_used=old_round.hints_used,   # carry over counters
-        passes_used=old_round.passes_used, # carry over counters
-    )
-
-    emb = discord.Embed(
-        title="🎤 Mic Game – New Song!",
-        description=build_round_description(new_round),
-        color=discord.Color.blurple()
-    )
-    if new_round.genre:
-        emb.add_field(name="Genre", value=new_round.genre, inline=True)
-    emb.set_footer(text=f"⏱ Time left: {ANSWER_TIME_LIMIT}s")
-
-    await msg.edit(embed=emb)
-
-    active_rounds[channel.id] = new_round
-    bot.loop.create_task(run_karaoke_round(new_round, channel, msg))
-
-
-# ------------- GAME LOGIC -------------
-
-async def run_karaoke_round(round_obj: KaraokeRound, channel: discord.TextChannel, msg: discord.Message):
-    """
-    Main game loop for one song.
-    - Ends on correct guess or timeout.
-    - If all 3 hints + 3 passes used and still no winner on timeout → full reset.
-    """
-    round_obj.message_id = msg.id
-    active_rounds[channel.id] = round_obj
-
-    streak_by_channel.setdefault(channel.id, 0)
-
-    bot.loop.create_task(update_embed_timer(round_obj, channel))
-    bot.loop.create_task(bump_reminder(round_obj, channel))
-
-    try:
-        while round_obj.is_active:
-            remaining = (round_obj.ends_at - datetime.now(timezone.utc)).total_seconds()
-            if remaining <= 0:
-                break
-
-            try:
-                guess_msg: discord.Message = await bot.wait_for(
-                    "message",
-                    timeout=remaining,
-                    check=lambda m: (
-                        m.channel.id == channel.id
-                        and not m.author.bot
-                        and round_obj.is_active
-                    )
-                )
-            except asyncio.TimeoutError:
-                break
-
-            if not round_obj.is_active:
-                break
-
-            if _is_correct_guess(round_obj, guess_msg.content):
-                round_obj.is_active = False
-                round_obj.winner_id = guess_msg.author.id
-
-                scores = scores_by_channel.setdefault(channel.id, {})
-                scores[guess_msg.author.id] = scores.get(guess_msg.author.id, 0) + 1
-
-                streak_by_channel[channel.id] = streak_by_channel.get(channel.id, 0) + 1
-
-                try:
-                    current_msg = await channel.fetch_message(round_obj.message_id)
-                except discord.NotFound:
-                    current_msg = None
-
-                if current_msg and current_msg.embeds:
-                    emb = current_msg.embeds[0]
-                    mode_text = {
-                        "title": "Title",
-                        "artist": "Artist",
-                        "either": "Title or Artist",
-                    }.get(round_obj.mode, "Title or Artist")
-                    emb.color = discord.Color.green()
-                    emb.title = "🎤 Mic Round – We have a winner!"
-                    emb.description = (
-                        f"**Mode:** Guess the {mode_text}\n"
-                        f"**Song:** {round_obj.song_title} – {round_obj.artist}\n"
-                        f"**Winner:** {guess_msg.author.mention}\n\n"
-                        "Start another `/mic` round anytime."
-                    )
-                    emb.set_footer(text="Round complete.")
-                    await current_msg.edit(embed=emb)
-
-                await channel.send(
-                    f"✅ {guess_msg.author.mention} got it right! "
-                    f"The song was **{round_obj.song_title}** by **{round_obj.artist}**.\n"
-                    f"(Solved streak in this channel: `{streak_by_channel[channel.id]}`)"
-                )
-
-                await post_scoreboard(channel)
-                break
-
-        # timeout path
-        if round_obj.is_active:
-            round_obj.is_active = False
-            try:
-                current_msg = await channel.fetch_message(round_obj.message_id)
-            except discord.NotFound:
-                current_msg = None
-
-            if current_msg and current_msg.embeds:
-                emb = current_msg.embeds[0]
-                mode_text = {
-                    "title": "Title",
-                    "artist": "Artist",
-                    "either": "Title or Artist",
-                }.get(round_obj.mode, "Title or Artist")
-                emb.color = discord.Color.red()
-                emb.title = "⏰ Time's up!"
-                emb.description = (
-                    f"**Mode:** Guess the {mode_text}\n"
-                    f"No one guessed it in time.\n\n"
-                    f"**Song:** {round_obj.song_title} – {round_obj.artist}\n\n"
-                    f"Hints used: `{round_obj.hints_used}/3`, Passes used: `{round_obj.passes_used}/3`"
-                )
-                emb.set_footer(text="Round complete.")
-                await current_msg.edit(embed=emb)
-
-            await channel.send(
-                f"⏰ Time's up! The song was **{round_obj.song_title}** by **{round_obj.artist}**."
-            )
-
-            streak_by_channel[channel.id] = 0
-
-            # if 3 hints AND 3 passes used, nuke the game
-            if round_obj.hints_used >= 3 and round_obj.passes_used >= 3:
-                scores_by_channel[channel.id] = {}
-                await channel.send(
-                    "🧨 All **3 hints** and **3 passes** were used and still no one got it.\n"
-                    "__Mic game has been reset in this channel.__ Scoreboard wiped."
-                )
-
-            await post_scoreboard(channel)
-
-    finally:
-        if active_rounds.get(channel.id) is round_obj:
-            active_rounds.pop(channel.id, None)
-
-
-async def update_embed_timer(round_obj: KaraokeRound, channel: discord.TextChannel):
-    """Updates the footer with remaining time while the round is active."""
-    await asyncio.sleep(1)
-
-    while round_obj.is_active:
-        try:
-            msg = await channel.fetch_message(round_obj.message_id)
-        except discord.NotFound:
-            break
-
-        if not msg.embeds:
-            break
-
-        remaining = int((round_obj.ends_at - datetime.now(timezone.utc)).total_seconds())
-        if remaining < 0:
-            remaining = 0
-
-        emb = msg.embeds[0]
-        emb.set_footer(text=f"⏱ Time left: {remaining}s")
-        try:
-            await msg.edit(embed=emb)
-        except discord.HTTPException:
-            pass
-
+    while True:
+        remaining = (ends_at - datetime.now(timezone.utc)).total_seconds()
         if remaining <= 0:
             break
 
-        await asyncio.sleep(5)
+        try:
+            msg: discord.Message = await bot.wait_for(
+                "message",
+                timeout=remaining,
+                check=lambda m: (
+                    m.channel.id == channel.id
+                    and not m.author.bot
+                ),
+            )
+        except asyncio.TimeoutError:
+            break
+
+        if is_correct_guess(song, msg.content):
+            winner_id = msg.author.id
+            winner_msg = msg
+            break
+
+    # Winner reaction + answer embed
+    if winner_id is not None and winner_msg is not None:
+        try:
+            await winner_msg.add_reaction("🎤")
+        except discord.HTTPException:
+            pass
+
+        answer_embed = discord.Embed(
+            title="✅ Answer guessed!",
+            description=(
+                f"**Song:** {song.song_title} – {song.artist}\n"
+                f"**Winner:** <@{winner_id}>\n\n"
+                f"Next song in **{BREAK_TIME} seconds**..."
+            ),
+            color=discord.Color.green(),
+        )
+        answer_embed.set_footer(text="Answer locked. Get ready for the next level.")
+        await channel.send(embed=answer_embed)
+
+        # Update scores
+        scores[winner_id] = scores.get(winner_id, 0) + 1
+
+    else:
+        answer_embed = discord.Embed(
+            title="⏰ Time's up!",
+            description=(
+                "No one guessed it in time.\n\n"
+                f"**Song:** {song.song_title} – {song.artist}\n\n"
+                f"Next song in **{BREAK_TIME} seconds**..."
+            ),
+            color=discord.Color.red(),
+        )
+        answer_embed.set_footer(text="Better luck next round.")
+        await channel.send(embed=answer_embed)
+
+    return winner_id, song
 
 
-async def bump_reminder(round_obj: KaraokeRound, channel: discord.TextChannel):
-    """Halfway reminder with jump link so embed doesn't get lost."""
-    await asyncio.sleep(ANSWER_TIME_LIMIT / 2)
-    if not round_obj.is_active:
-        return
+async def show_ranking(
+    channel: discord.TextChannel,
+    scores: Dict[int, int],
+    next_level: int,
+    total_levels: int,
+    final: bool = False,
+):
+    """Show Team Ranking embed."""
+    embed = discord.Embed(
+        title="🏆 Team Ranking",
+        color=discord.Color.gold(),
+    )
 
-    try:
-        msg = await channel.fetch_message(round_obj.message_id)
-    except discord.NotFound:
-        return
+    if not scores:
+        embed.description = "No points yet. Everyone is still on 0."
+    else:
+        sorted_scores = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
+        lines = []
+        for i, (user_id, score) in enumerate(sorted_scores, start=1):
+            lines.append(f"**{i}.** <@{user_id}> — `{score}` point(s)")
+        embed.description = "\n".join(lines)
+
+    if final:
+        embed.add_field(
+            name="Game Over",
+            value="That’s the last level. Use `/mic` or `m.mic` to start a new game.",
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="Next Step",
+            value=f"Level **{next_level}/{total_levels}** will start soon.",
+            inline=False,
+        )
+
+    await channel.send(embed=embed)
+
+
+async def run_mic_game(
+    channel: discord.TextChannel,
+    total_levels: int,
+):
+    """Main game loop for one /mic session in a channel."""
+    active_games[channel.id] = True
+    scores: Dict[int, int] = {}
 
     await channel.send(
-        f"🎵 Mic round still live! You’ve got about "
-        f"**{int((round_obj.ends_at - datetime.now(timezone.utc)).total_seconds())}s** left.\n"
-        f"Jump to the question: {msg.jump_url}"
+        f"🎮 **Mic game starting!**\n"
+        f"Levels: `{total_levels}`. Try to guess the **title or artist** each round.\n"
+        f"Type `/mic` or `m.mic` again later to start a fresh game."
     )
+
+    for level in range(1, total_levels + 1):
+        # game may be stopped in future if you add a stop command
+        if not active_games.get(channel.id, False):
+            break
+
+        _winner, _song = await play_single_level(channel, level, total_levels, scores)
+
+        # break between songs
+        await asyncio.sleep(BREAK_TIME)
+
+        final_round = (level == total_levels)
+        await show_ranking(
+            channel,
+            scores,
+            next_level=level + 1,
+            total_levels=total_levels,
+            final=final_round,
+        )
+
+        # break again so the ranking can be read before next level
+        if not final_round:
+            await asyncio.sleep(3)
+
+    # game finished
+    active_games.pop(channel.id, None)
 
 
 # ------------- EVENTS -------------
@@ -562,346 +401,86 @@ async def on_ready():
 
 
 # ------------- SLASH COMMANDS -------------
-@bot.tree.command(name="mic", description="Start a 60-second karaoke guessing round in this channel.")
+
+@bot.tree.command(
+    name="mic",
+    description="Start a Mic lyrics guessing game (like Gartic, multiple levels)."
+)
 @app_commands.describe(
-    mode="What are players guessing?",
-    genre="Optional: pick a genre like pop, rock, kpop, rnb, etc."
+    rounds=f"How many levels to play (default {DEFAULT_ROUNDS})"
 )
-@app_commands.choices(
-    mode=[
-        app_commands.Choice(name="Guess the title", value="title"),
-        app_commands.Choice(name="Guess the artist", value="artist"),
-        app_commands.Choice(name="Guess title or artist", value="either"),
-    ]
-)
-async def mic_command(
+async def mic_slash(
     interaction: discord.Interaction,
-    mode: app_commands.Choice[str],
-    genre: Optional[str] = None
+    rounds: Optional[int] = None,
 ):
     channel = interaction.channel
     if not isinstance(channel, discord.TextChannel):
         await interaction.response.send_message(
-            "Please use this command in a normal text channel.", ephemeral=True
+            "Please use this in a normal text channel.",
+            ephemeral=True,
         )
         return
 
-    if channel.id in active_rounds and active_rounds[channel.id].is_active:
+    if active_games.get(channel.id, False):
         await interaction.response.send_message(
-            "There is already a mic round running in this channel. Wait for it to finish first.",
-            ephemeral=True
+            "There is already a Mic game running in this channel.",
+            ephemeral=True,
         )
         return
 
-    mode_value = mode.value  # "title", "artist", "either"
-
-    await interaction.response.defer(thinking=True)
-
-    try:
-        song_data = await generate_song_round(genre)
-    except Exception as e:
-        print(f"Error generating song round: {e}")
-        await interaction.followup.send(
-            "I couldn't generate a new song round just now. Please try again in a moment.",
-            ephemeral=True
-        )
-        return
-
-    song_title = song_data["song_title"]
-    artist = song_data["artist"]
-    lyric_hints = song_data.get("lyric_hints") or []
-    clue = song_data["clue"]
-    acc_title = song_data.get("acceptable_title_answers") or []
-    acc_artist = song_data.get("acceptable_artist_answers") or []
-
-    ends_at = datetime.now(timezone.utc) + timedelta(seconds=ANSWER_TIME_LIMIT)
-
-    initial_hints_used = 1 if lyric_hints else 0
-
-    round_obj = KaraokeRound(
-        channel_id=channel.id,
-        message_id=0,  # set after send
-        song_title=song_title,
-        artist=artist,
-        lyric_hints=lyric_hints,
-        acceptable_title_answers=acc_title,
-        acceptable_artist_answers=acc_artist,
-        clue=clue,
-        mode=mode_value,
-        is_active=True,
-        ends_at=ends_at,
-        winner_id=None,
-        genre=genre,
-        hints_used=initial_hints_used,  # show first lyric line immediately
-        passes_used=0,
-    )
-
-
-    emb = discord.Embed(
-        title="🎤 Mic – Karaoke Guessing Game",
-        description=build_round_description(round_obj),
-        color=discord.Color.blurple()
-    )
-    if genre:
-        emb.add_field(name="Genre", value=genre, inline=True)
-    emb.set_footer(text=f"⏱ Time left: {ANSWER_TIME_LIMIT}s")
-
-    msg = await interaction.followup.send(embed=emb, wait=True)
-    round_obj.message_id = msg.id
-
-    bot.loop.create_task(run_karaoke_round(round_obj, channel, msg))
-
-@bot.tree.command(
-    name="mic_hint",
-    description="Use one of the shared hints for the current mic game (max 3 per game)."
-)
-async def mic_hint_command(interaction: discord.Interaction):
-    channel = interaction.channel
-    if not isinstance(channel, discord.TextChannel):
-        await interaction.response.send_message(
-            "Use this in the same text channel as the game.", ephemeral=True
-        )
-        return
-
-    round_obj = active_rounds.get(channel.id)
-    if not round_obj or not round_obj.is_active:
-        await interaction.response.send_message(
-            "There is no active mic round in this channel.", ephemeral=True
-        )
-        return
-
-    if round_obj.hints_used >= 3:
-        await interaction.response.send_message(
-            "All **3 hints** for this game have already been used.", ephemeral=True
-        )
-        return
-
-    if round_obj.hints_used >= len(round_obj.lyric_hints):
-        await interaction.response.send_message(
-            "No more hints are available for this song.", ephemeral=True
-        )
-        return
-
-    round_obj.hints_used += 1
-
-    try:
-        msg = await channel.fetch_message(round_obj.message_id)
-    except discord.NotFound:
-        await interaction.response.send_message(
-            "I couldn't find the mic message to update.", ephemeral=True
-        )
-        return
-
-    if msg.embeds:
-        emb = msg.embeds[0]
-        emb.description = build_round_description(round_obj)
-        try:
-            await msg.edit(embed=emb)
-        except discord.HTTPException:
-            pass
+    total_levels = rounds or DEFAULT_ROUNDS
+    if total_levels < 1:
+        total_levels = 1
+    if total_levels > 50:
+        total_levels = 50
 
     await interaction.response.send_message(
-        f"Hint `{round_obj.hints_used}/3` revealed for this game.", ephemeral=True
-    )
-    await channel.send(
-        f"💡 A hint has been used! (`{round_obj.hints_used}/3`) Check the mic embed for updated hints."
+        f"Starting Mic game with **{total_levels}** levels...", ephemeral=True
     )
 
-
-@bot.tree.command(
-    name="mic_pass",
-    description="Skip the current song (shared 3 passes per game)."
-)
-async def mic_pass_command(interaction: discord.Interaction):
-    channel = interaction.channel
-    if not isinstance(channel, discord.TextChannel):
-        await interaction.response.send_message(
-            "Use this in the same text channel as the game.", ephemeral=True
-        )
-        return
-
-    round_obj = active_rounds.get(channel.id)
-    if not round_obj or not round_obj.is_active:
-        await interaction.response.send_message(
-            "There is no active mic round in this channel.", ephemeral=True
-        )
-        return
-
-    if round_obj.passes_used >= 3:
-        await interaction.response.send_message(
-            "All **3 passes** for this game have already been used.", ephemeral=True
-        )
-        return
-
-    round_obj.passes_used += 1
-    used = round_obj.passes_used
-
-    round_obj.is_active = False
-
-    await interaction.response.send_message(
-        f"You used a pass. (`{used}/3` for this game)", ephemeral=True
-    )
-
-    await channel.send(
-        f"⏭️ Song passed! (`{used}/3` passes used this game)\n"
-        "Loading a new song in the same game..."
-    )
-
-    await start_new_song_after_pass(round_obj, channel)
+    bot.loop.create_task(run_mic_game(channel, total_levels))
 
 
-# ------------- PREFIX COMMANDS (m.hint / m.pass) -------------
+# ------------- PREFIX COMMANDS -------------
 
-@bot.command(name="hint")
-async def m_hint(ctx: commands.Context):
-    """Prefix version: m.hint"""
-    channel = ctx.channel
-    if not isinstance(channel, discord.TextChannel):
-        await ctx.reply("Use this in the same text channel as the game.", mention_author=False)
-        return
-
-    round_obj = active_rounds.get(channel.id)
-    if not round_obj or not round_obj.is_active:
-        await ctx.reply("There is no active mic round in this channel.", mention_author=False)
-        return
-
-    if round_obj.hints_used >= 3:
-        await ctx.reply("All **3 hints** for this game have already been used.", mention_author=False)
-        return
-
-    if round_obj.hints_used >= len(round_obj.lyric_hints):
-        await ctx.reply("No more hints are available for this song.", mention_author=False)
-        return
-
-    round_obj.hints_used += 1
-
-    try:
-        msg = await channel.fetch_message(round_obj.message_id)
-    except discord.NotFound:
-        await ctx.reply("I couldn't find the mic message to update.", mention_author=False)
-        return
-
-    if msg.embeds:
-        emb = msg.embeds[0]
-        emb.description = build_round_description(round_obj)
-        try:
-            await msg.edit(embed=emb)
-        except discord.HTTPException:
-            pass
-
-    await ctx.reply(f"Hint `{round_obj.hints_used}/3` revealed for this game.", mention_author=False)
-    await channel.send(
-        f"💡 A hint has been used! (`{round_obj.hints_used}/3`) Check the mic embed for updated hints."
-    )
 @bot.command(name="mic")
-async def mic_prefix(
-    ctx: commands.Context,
-    mode: str = "either",
-    *,  # everything after this is treated as one string
-    genre: Optional[str] = None
-):
-    """Prefix version: m.mic [mode] [genre]"""
+async def mic_prefix(ctx: commands.Context, rounds: Optional[int] = None):
+    """Prefix version: m.mic [rounds]"""
     channel = ctx.channel
     if not isinstance(channel, discord.TextChannel):
-        await ctx.reply("Please use this in a normal text channel.", mention_author=False)
-        return
-
-    if channel.id in active_rounds and active_rounds[channel.id].is_active:
         await ctx.reply(
-            "There is already a mic round running in this channel. Wait for it to finish first.",
-            mention_author=False
+            "Please use this in a normal text channel.",
+            mention_author=False,
         )
         return
 
-    mode_value = mode.lower()
-    if mode_value not in ("title", "artist", "either"):
-        mode_value = "either"
+    if active_games.get(channel.id, False):
+        await ctx.reply(
+            "There is already a Mic game running in this channel.",
+            mention_author=False,
+        )
+        return
 
+    total_levels = rounds or DEFAULT_ROUNDS
     try:
-        song_data = await generate_song_round(genre)
-    except Exception as e:
-        print(f"Error generating song round (prefix mic): {e}")
-        await ctx.reply(
-            "I couldn't generate a new song round just now. Please try again in a moment.",
-            mention_author=False
-        )
-        return
+        total_levels = int(total_levels)
+    except (TypeError, ValueError):
+        total_levels = DEFAULT_ROUNDS
 
-    song_title = song_data["song_title"]
-    artist = song_data["artist"]
-    lyric_hints = song_data.get("lyric_hints") or []
-    clue = song_data["clue"]
-    acc_title = song_data.get("acceptable_title_answers") or []
-    acc_artist = song_data.get("acceptable_artist_answers") or []
+    if total_levels < 1:
+        total_levels = 1
+    if total_levels > 50:
+        total_levels = 50
 
-    ends_at = datetime.now(timezone.utc) + timedelta(seconds=ANSWER_TIME_LIMIT)
-
-    round_obj = KaraokeRound(
-        channel_id=channel.id,
-        message_id=0,
-        song_title=song_title,
-        artist=artist,
-        lyric_hints=lyric_hints,
-        acceptable_title_answers=acc_title,
-        acceptable_artist_answers=acc_artist,
-        clue=clue,
-        mode=mode_value,
-        is_active=True,
-        ends_at=ends_at,
-        winner_id=None,
-        genre=genre,
-        hints_used=0,
-        passes_used=0,
+    await ctx.reply(
+        f"Starting Mic game with **{total_levels}** levels...",
+        mention_author=False,
     )
 
-    emb = discord.Embed(
-        title="🎤 Mic – Karaoke Guessing Game",
-        description=build_round_description(round_obj),
-        color=discord.Color.blurple()
-    )
-    if genre:
-        emb.add_field(name="Genre", value=genre, inline=True)
-    emb.set_footer(text=f"⏱ Time left: {ANSWER_TIME_LIMIT}s")
-
-    msg = await ctx.send(embed=emb)
-    round_obj.message_id = msg.id
-
-    bot.loop.create_task(run_karaoke_round(round_obj, channel, msg))
-
-
-@bot.command(name="pass")
-async def m_pass(ctx: commands.Context):
-    """Prefix version: m.pass"""
-    channel = ctx.channel
-    if not isinstance(channel, discord.TextChannel):
-        await ctx.reply("Use this in the same text channel as the game.", mention_author=False)
-        return
-
-    round_obj = active_rounds.get(channel.id)
-    if not round_obj or not round_obj.is_active:
-        await ctx.reply("There is no active mic round in this channel.", mention_author=False)
-        return
-
-    if round_obj.passes_used >= 3:
-        await ctx.reply("All **3 passes** for this game have already been used.", mention_author=False)
-        return
-
-    round_obj.passes_used += 1
-    used = round_obj.passes_used
-
-    round_obj.is_active = False
-
-    await ctx.reply(f"You used a pass. (`{used}/3` for this game)", mention_author=False)
-    await channel.send(
-        f"⏭️ Song passed! (`{used}/3` passes used this game)\n"
-        "Loading a new song in the same game..."
-    )
-
-    await start_new_song_after_pass(round_obj, channel)
+    bot.loop.create_task(run_mic_game(channel, total_levels))
 
 
 # ------------- RUN -------------
-from karaoke_bot import bot, DISCORD_TOKEN
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
