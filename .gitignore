@@ -1,0 +1,18 @@
+# env
+.env
+
+# python crap
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# venvs
+venv/
+.env/
+.env.bak/
+
+# IDE
+.vscode/
+.idea/
