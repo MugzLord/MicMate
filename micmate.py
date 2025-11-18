@@ -383,11 +383,8 @@ async def run_mic_game(
     scores: Dict[int, int] = {}
     last_song: Optional[SongRound] = None
 
-    await channel.send(
-        f"🎮 **Mic game starting!**\n"
-        f"Levels: `{total_levels}`. Try to guess the **title or artist** each round.\n"
-        f"Use `/mic` or `m.mic` again later to start a new game."
-    )
+    await channel.send("🎮 **Karaoke game starting!**")
+
 
     try:
         for level in range(1, total_levels + 1):
