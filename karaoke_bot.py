@@ -34,7 +34,7 @@ intents.message_content = True
 
 bot = commands.Bot(
     command_prefix=commands.when_mentioned_or("!", "m."),
-    intents=intents
+    intents=intents,
 )
 
 
@@ -49,23 +49,47 @@ class SongRound:
     acceptable_artists: List[str]
 
 
-# per-channel flag to avoid multiple games in same channel
+# One active game per channel
 active_games: Dict[int, bool] = {}
 
 
-# ------------- OPENAI HELPERS -------------
+# ------------- HELPERS -------------
+
+def _norm(s: str) -> str:
+    return " ".join(s.lower().strip().split())
+
+
+def is_correct_guess(song: SongRound, guess: str) -> bool:
+    g = _norm(guess)
+    if not g:
+        return False
+
+    title_norm = _norm(song.song_title)
+    artist_norm = _norm(song.artist)
+
+    # Check title answers
+    for ans in song.acceptable_titles:
+        if g == _norm(ans):
+            return True
+    if title_norm and title_norm in g:
+        return True
+
+    # Check artist answers
+    for ans in song.acceptable_artists:
+        if g == _norm(ans):
+            return True
+    if artist_norm and artist_norm in g:
+        return True
+
+    return False
+
+
+# ------------- OPENAI -------------
 
 async def generate_song_round() -> SongRound:
     """
-    Ask OpenAI for:
-      - song_title
-      - artist
-      - lyric_lines (1-3 very short lines)
-      - acceptable_title_answers
-      - acceptable_artist_answers
-
-    If anything goes wrong, we fall back to a static song
-    so the game never breaks.
+    Ask OpenAI for a song with 1–3 short lyric lines and acceptable answers.
+    If anything fails, return a safe fallback.
     """
     fallback = SongRound(
         song_title="Imagine",
@@ -178,36 +202,7 @@ Rules:
         return fallback
 
 
-# ------------- GAME HELPERS -------------
-
-def _norm(s: str) -> str:
-    return " ".join(s.lower().strip().split())
-
-
-def is_correct_guess(song: SongRound, guess: str) -> bool:
-    g = _norm(guess)
-    if not g:
-        return False
-
-    title_norm = _norm(song.song_title)
-    artist_norm = _norm(song.artist)
-
-    # Check title answers
-    for ans in song.acceptable_titles:
-        if g == _norm(ans):
-            return True
-    if title_norm and title_norm in g:
-        return True
-
-    # Check artist answers
-    for ans in song.acceptable_artists:
-        if g == _norm(ans):
-            return True
-    if artist_norm and artist_norm in g:
-        return True
-
-    return False
-
+# ------------- GAME LOGIC -------------
 
 async def play_single_level(
     channel: discord.TextChannel,
@@ -218,10 +213,14 @@ async def play_single_level(
 ) -> Tuple[Optional[int], SongRound]:
     """
     Runs one level:
+    - gets a song (tries to avoid repeating last round)
     - sends lyrics embed
-    - avoids repeating the previous song if possible
-    - waits up to ROUND_TIME for correct guess
+    - waits up to ROUND_TIME for a correct guess
+    - reacts with 🎤 on the winning message
+    - sends Answer / Time's up embed
+    Returns (winner_id or None, song).
     """
+
     # Try a few times to get a different song than last round
     attempts = 0
     while True:
@@ -235,19 +234,16 @@ async def play_single_level(
         same_artist = _norm(song.artist) == _norm(last_song.artist)
 
         if not (same_title and same_artist):
-            break  # different song, good
+            break  # different song
 
         if attempts >= 5:
-            # Give up after 5 tries, just use whatever we got
-            print("[MicMate] Got the same song multiple times from OpenAI, using it anyway.")
+            print("[MicMate] Same song returned multiple times, using it anyway.")
             break
 
-    # Build lyrics block
     lyrics_block = "\n".join(f"• “{line}”" for line in song.lyric_lines)
-
     desc = (
         f"**Lyrics:**\n{lyrics_block}\n\n"
-        f"Mode: Guess the **TITLE** or **ARTIST** in chat.\n"
+        "Mode: Guess the **TITLE** or **ARTIST** in chat.\n"
         f"You have **{ROUND_TIME} seconds**."
     )
 
@@ -258,7 +254,7 @@ async def play_single_level(
     )
     embed.set_footer(text=f"Time left: {ROUND_TIME} seconds")
 
-    question_msg = await channel.send(embed=embed)
+    await channel.send(embed=embed)
 
     # Wait for guesses
     winner_id: Optional[int] = None
@@ -287,7 +283,7 @@ async def play_single_level(
             winner_msg = msg
             break
 
-    # Winner reaction + answer embed
+    # Winner vs no-winner embeds
     if winner_id is not None and winner_msg is not None:
         try:
             await winner_msg.add_reaction("🎤")
@@ -306,7 +302,6 @@ async def play_single_level(
         answer_embed.set_footer(text="Answer locked. Get ready for the next level.")
         await channel.send(embed=answer_embed)
 
-        # Update scores
         scores[winner_id] = scores.get(winner_id, 0) + 1
 
     else:
@@ -323,7 +318,6 @@ async def play_single_level(
         answer_embed.set_footer(text="Round failed. Mic session ended.")
         await channel.send(embed=answer_embed)
 
-
     return winner_id, song
 
 
@@ -334,7 +328,7 @@ async def show_ranking(
     total_levels: int,
     final: bool = False,
 ):
-    """Show Team Ranking embed."""
+    """Show Team Ranking embed (no level x/total, only level x)."""
     embed = discord.Embed(
         title="🏆 Team Ranking",
         color=discord.Color.gold(),
@@ -352,7 +346,8 @@ async def show_ranking(
     if final:
         embed.add_field(
             name="Game Over",
-            value="That’s the last level. Use `/mic` or `m.mic` to start a new game.",
+            value="That’s the last level for this Mic session.\n"
+                  "Use `/mic` or `m.mic` to start a new game.",
             inline=False,
         )
     else:
@@ -369,6 +364,7 @@ async def run_mic_game(
     channel: discord.TextChannel,
     total_levels: int,
 ):
+    """Main game loop for one Mic session in a channel."""
     active_games[channel.id] = True
     scores: Dict[int, int] = {}
     last_song: Optional[SongRound] = None
@@ -376,55 +372,54 @@ async def run_mic_game(
     await channel.send(
         f"🎮 **Mic game starting!**\n"
         f"Levels: `{total_levels}`. Try to guess the **title or artist** each round.\n"
-        f"Type `/mic` or `m.mic` again later to start a fresh game."
+        f"Use `/mic` or `m.mic` again later to start a new game."
     )
 
-    for level in range(1, total_levels + 1):
-        if not active_games.get(channel.id, False):
-            break
+    try:
+        for level in range(1, total_levels + 1):
+            if not active_games.get(channel.id, False):
+                break
 
-        winner_id, this_song = await play_single_level(
-            channel,
-            level,
-            total_levels,
-            scores,
-            last_song=last_song,
-        )
-        last_song = this_song  # remember for next round
-        
-        # If no one got it right, game stops here
-        if winner_id is None:
+            winner_id, this_song = await play_single_level(
+                channel,
+                level,
+                total_levels,
+                scores,
+                last_song=last_song,
+            )
+            last_song = this_song
+
+            # If no winner → stop the whole game here
+            if winner_id is None:
+                await show_ranking(
+                    channel,
+                    scores,
+                    next_level=level,
+                    total_levels=total_levels,
+                    final=True,
+                )
+                break
+
+            # Winner path → continue
+            await asyncio.sleep(BREAK_TIME)
+
+            final_round = (level == total_levels)
             await show_ranking(
                 channel,
                 scores,
-                next_level=level,      # not used when final=True
+                next_level=level + 1,
                 total_levels=total_levels,
-                final=True,
+                final=final_round,
             )
-            break       
-       
-        # Otherwise continue as normal
-        await asyncio.sleep(BREAK_TIME)
 
-        final_round = (level == total_levels)
-        await show_ranking(
-            channel,
-            scores,
-            next_level=level + 1,
-            total_levels=total_levels,
-            final=final_round,
-        )
+            if not final_round:
+                await asyncio.sleep(3)
 
-        if not final_round:
-            await asyncio.sleep(3)
-
-
-        # break again so the ranking can be read before next level
-        if not final_round:
-            await asyncio.sleep(3)
-
-    # game finished
-    active_games.pop(channel.id, None)
+    except Exception as e:
+        print("[MicMate] Unexpected error in run_mic_game:", repr(e))
+        await channel.send("⚠️ Mic ran into an error and had to stop this game.")
+    finally:
+        active_games.pop(channel.id, None)
 
 
 # ------------- EVENTS -------------
@@ -439,7 +434,7 @@ async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 
-# ------------- SLASH COMMANDS -------------
+# ------------- SLASH COMMAND -------------
 
 @bot.tree.command(
     name="mic",
@@ -474,13 +469,14 @@ async def mic_slash(
         total_levels = 50
 
     await interaction.response.send_message(
-        f"Starting Mic game with **{total_levels}** levels...", ephemeral=True
+        f"Starting Mic game with **{total_levels}** levels...",
+        ephemeral=True,
     )
 
     bot.loop.create_task(run_mic_game(channel, total_levels))
 
 
-# ------------- PREFIX COMMANDS -------------
+# ------------- PREFIX COMMAND -------------
 
 @bot.command(name="mic")
 async def mic_prefix(ctx: commands.Context, rounds: Optional[int] = None):
