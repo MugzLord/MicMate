@@ -214,17 +214,33 @@ async def play_single_level(
     level: int,
     total_levels: int,
     scores: Dict[int, int],
+    last_song: Optional[SongRound] = None,
 ) -> Tuple[Optional[int], SongRound]:
     """
     Runs one level:
     - sends lyrics embed
+    - avoids repeating the previous song if possible
     - waits up to ROUND_TIME for correct guess
-    - reacts on the winning message
-    - shows "Answer guessed" or "Time's up" embed
-    Returns (winner_id or None, SongRound)
     """
+    # Try a few times to get a different song than last round
+    attempts = 0
+    while True:
+        song = await generate_song_round()
+        attempts += 1
 
-    song = await generate_song_round()
+        if last_song is None:
+            break
+
+        same_title = _norm(song.song_title) == _norm(last_song.song_title)
+        same_artist = _norm(song.artist) == _norm(last_song.artist)
+
+        if not (same_title and same_artist):
+            break  # different song, good
+
+        if attempts >= 5:
+            # Give up after 5 tries, just use whatever we got
+            print("[MicMate] Got the same song multiple times from OpenAI, using it anyway.")
+            break
 
     # Build lyrics block
     lyrics_block = "\n".join(f"• “{line}”" for line in song.lyric_lines)
@@ -236,7 +252,7 @@ async def play_single_level(
     )
 
     embed = discord.Embed(
-        title=f"🎶 Mic – Level {level}/{total_levels}",
+        title=f"🎶 Mic – Level {level}",
         description=desc,
         color=discord.Color.blurple(),
     )
@@ -299,12 +315,14 @@ async def play_single_level(
             description=(
                 "No one guessed it in time.\n\n"
                 f"**Song:** {song.song_title} – {song.artist}\n\n"
-                f"Next song in **{BREAK_TIME} seconds**..."
+                "Game over for this Mic session.\n"
+                "Use `/mic` or `m.mic` to start a new game."
             ),
             color=discord.Color.red(),
         )
-        answer_embed.set_footer(text="Better luck next round.")
+        answer_embed.set_footer(text="Round failed. Mic session ended.")
         await channel.send(embed=answer_embed)
+
 
     return winner_id, song
 
@@ -340,7 +358,7 @@ async def show_ranking(
     else:
         embed.add_field(
             name="Next Step",
-            value=f"Level **{next_level}/{total_levels}** will start soon.",
+            value=f"Level **{next_level}** will start soon.",
             inline=False,
         )
 
@@ -351,9 +369,9 @@ async def run_mic_game(
     channel: discord.TextChannel,
     total_levels: int,
 ):
-    """Main game loop for one /mic session in a channel."""
     active_games[channel.id] = True
     scores: Dict[int, int] = {}
+    last_song: Optional[SongRound] = None
 
     await channel.send(
         f"🎮 **Mic game starting!**\n"
@@ -362,13 +380,30 @@ async def run_mic_game(
     )
 
     for level in range(1, total_levels + 1):
-        # game may be stopped in future if you add a stop command
         if not active_games.get(channel.id, False):
             break
 
-        _winner, _song = await play_single_level(channel, level, total_levels, scores)
-
-        # break between songs
+        winner_id, this_song = await play_single_level(
+            channel,
+            level,
+            total_levels,
+            scores,
+            last_song=last_song,
+        )
+        last_song = this_song  # remember for next round
+        
+        # If no one got it right, game stops here
+        if winner_id is None:
+            await show_ranking(
+                channel,
+                scores,
+                next_level=level,      # not used when final=True
+                total_levels=total_levels,
+                final=True,
+            )
+            break       
+       
+        # Otherwise continue as normal
         await asyncio.sleep(BREAK_TIME)
 
         final_round = (level == total_levels)
@@ -379,6 +414,10 @@ async def run_mic_game(
             total_levels=total_levels,
             final=final_round,
         )
+
+        if not final_round:
+            await asyncio.sleep(3)
+
 
         # break again so the ranking can be read before next level
         if not final_round:
