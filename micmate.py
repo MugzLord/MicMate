@@ -601,7 +601,7 @@ async def on_ready():
 
 @bot.tree.command(
     name="mic",
-    description="Start a Mic lyrics guessing game (like Gartic, multiple levels)."
+    description="Start a Mic lyrics guessing game."
 )
 @app_commands.describe(
     rounds=f"How many levels to play (default {DEFAULT_ROUNDS})"
