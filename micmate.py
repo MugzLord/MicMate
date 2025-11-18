@@ -632,7 +632,7 @@ async def mic_slash(
         total_levels = 50
 
     await interaction.response.send_message(
-        f"Starting Mic game with **{total_levels}** levels...",
+        f"Starting Mic game ...",
         ephemeral=True,
     )
 
