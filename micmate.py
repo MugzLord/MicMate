@@ -691,6 +691,23 @@ async def mic_hint_slash(interaction: discord.Interaction):
             "Use this in a normal text channel.", ephemeral=True
         )
         return
+
+    # ✅ Check that a game and a round are actually running
+    if not active_games.get(channel.id, False):
+        await interaction.response.send_message(
+            "There is no active Mic game in this channel.",
+            ephemeral=True,
+        )
+        return
+
+    if current_song.get(channel.id) is None:
+        await interaction.response.send_message(
+            "There is no active round to use a hint on.",
+            ephemeral=True,
+        )
+        return
+
+    # If we got here, it’s safe to use a hint
     await interaction.response.send_message(
         "Hint used.", ephemeral=True
     )
