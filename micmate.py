@@ -133,10 +133,21 @@ async def generate_song_round(
     # Genre / year text for the prompt
     genre_text = ""
     if genre:
-        genre_text = (
-            f"\nYou MUST choose a song that clearly fits this genre or scene: {genre}."
-            "\nDo NOT choose songs from other genres."
-        )
+        g_lower = genre.lower().strip()
+    
+        # Special handling for Christmas / holiday
+        if any(key in g_lower for key in ["christmas", "xmas", "holiday"]):
+            genre_text = (
+                "\nYou MUST choose a well-known Christmas / holiday song."
+                "\nThink of classic or popular festive tracks that people are likely to know."
+                "\nDo NOT choose non-Christmas songs."
+            )
+        else:
+            genre_text = (
+                f"\nYou MUST choose a song that clearly fits this genre or scene: {genre}."
+                "\nDo NOT choose songs from other genres."
+            )
+    
 
     year_text = ""
     if year:
