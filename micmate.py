@@ -25,8 +25,9 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 client_oa = OpenAI(api_key=OPENAI_API_KEY)
 
 ROUND_TIME = 60   # seconds to guess
-BREAK_TIME = 15   # seconds between rounds
-DEFAULT_ROUNDS = 10  # levels per /mic session
+BREAK_TIME = 10   # seconds between rounds
+RANK_DELAY = 3    # seconds before posting Team Ranking
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -312,7 +313,7 @@ async def play_single_level(
         print("[MicMate] Fatal error getting song:", repr(e))
         await channel.send(
             "⚠️ I couldn't load a new song just now, "
-            "so this Karaoke game has been stopped. Try `/mic` again in a bit."
+            "so this Mic game has been stopped. Try `/mic` again in a bit."
         )
         return None, None, False
 
@@ -529,9 +530,10 @@ async def run_mic_game(
                 break
 
             # Winner or pass -> continue
-            await asyncio.sleep(BREAK_TIME)
+            # First wait a short time, then show Team Ranking,
+            # then wait the remainder before the next song.
+            await asyncio.sleep(RANK_DELAY)
 
-            # If total_levels == 0 => infinite mode (no cap)
             final_round = (total_levels > 0 and level >= total_levels)
 
             await show_ranking(
@@ -543,11 +545,15 @@ async def run_mic_game(
             )
 
             if final_round:
-                # hit the requested max levels, end cleanly
                 break
 
-            await asyncio.sleep(3)
+            # Wait the remaining time before next lyrics embed
+            remaining_break = max(0, BREAK_TIME - RANK_DELAY)
+            if remaining_break > 0:
+                await asyncio.sleep(remaining_break)
+
             level += 1
+
 
     except Exception as e:
         print("[MicMate] Unexpected error in run_mic_game:", repr(e))
@@ -610,7 +616,7 @@ async def hint_prefix(ctx: commands.Context):
 
 @bot.tree.command(
     name="mic_hint",
-    description="Use one of the shared hints in the current Karaoke game.",
+    description="Use one of the shared hints in the current Mic game.",
 )
 async def mic_hint_slash(interaction: discord.Interaction):
     channel = interaction.channel
@@ -639,7 +645,7 @@ async def mic_pass_slash(interaction: discord.Interaction):
 
     if not active_games.get(channel.id, False):
         await interaction.response.send_message(
-            "There is no active Karaoke game in this channel.",
+            "There is no active Mic game in this channel.",
             ephemeral=True,
         )
         return
@@ -647,7 +653,7 @@ async def mic_pass_slash(interaction: discord.Interaction):
     used = passes_used.get(channel.id, 0)
     if used >= 3:
         await interaction.response.send_message(
-            "No passes left for this Karaoke game (3/3 used).",
+            "No passes left for this Mic game (3/3 used).",
             ephemeral=True,
         )
         return
@@ -718,38 +724,27 @@ async def mic_slash(
 async def mic_prefix(ctx: commands.Context, rounds: Optional[int] = None):
     channel = ctx.channel
     if not isinstance(channel, discord.TextChannel):
-        await ctx.reply(
-            "Please use this in a normal text channel.",
-            mention_author=False,
-        )
+        await ctx.reply("Please use this in a normal text channel.", mention_author=False)
         return
 
     if active_games.get(channel.id, False):
-        await ctx.reply(
-            "There is already a Karaoke game running in this channel.",
-            mention_author=False,
-        )
+        await ctx.reply("There is already a Mic game running in this channel.", mention_author=False)
         return
 
-    # rounds None -> infinite (0). If user types a number, use it as a cap.
+    # None = infinite, number = cap
     if rounds is None:
+        # no number given → infinite
         total_levels = 0
     else:
         try:
+            # number given → cap at that number
             total_levels = int(rounds)
         except (TypeError, ValueError):
-            total_levels = 0  # fallback to infinite
+            # if someone types nonsense, just fall back to infinite
+            total_levels = 0
 
-        if total_levels < 1:
-            total_levels = 1
-        if total_levels > 50:
-            total_levels = 50
 
-    await ctx.reply(
-        "Starting Mic game ...",
-        mention_author=False,
-    )
-
+    await ctx.reply("Starting Mic game ...", mention_author=False)
     bot.loop.create_task(run_mic_game(channel, total_levels))
 
 # ------------- RUN -------------
