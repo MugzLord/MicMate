@@ -1,7 +1,7 @@
 import os
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -35,7 +35,6 @@ bot = commands.Bot(
     command_prefix=commands.when_mentioned_or("!", "m."),
     intents=intents,
 )
-
 
 # ------------- STATE -------------
 
