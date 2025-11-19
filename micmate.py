@@ -24,10 +24,9 @@ if not OPENAI_API_KEY:
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 client_oa = OpenAI(api_key=OPENAI_API_KEY)
 
-ROUND_TIME = 60   # seconds to guess
-BREAK_TIME = 10   # seconds between rounds
-RANK_DELAY = 3    # seconds before posting Team Ranking
-
+ROUND_TIME = 60  # seconds to guess
+BREAK_TIME = 5   # seconds between rounds
+RANK_DELAY = 2   # seconds before posting Team Ranking
 
 intents = discord.Intents.default()
 intents.message_content = True
