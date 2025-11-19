@@ -115,17 +115,17 @@ def is_correct_guess(song: SongRound, guess: str) -> bool:
     return False
 
 # ------------- OPENAI -------------
-
 async def generate_song_round(
     last_song: Optional[SongRound] = None,
-    used_titles: Optional[set] = None,
+    used_titles: Optional[Set[str]] = None,
     genre: Optional[str] = None,
     year: Optional[str] = None,
 ) -> SongRound:
     """
     Ask the model for a song with 1–3 short lyric lines,
     some non-lyric hints, and acceptable answers.
-    No local fallback. If this fails, caller will stop the game.
+    No local hard-coded fallback – if this fails repeatedly,
+    caller will stop the game.
     """
     if used_titles is None:
         used_titles = set()
@@ -134,7 +134,7 @@ async def generate_song_round(
     genre_text = ""
     if genre:
         g_lower = genre.lower().strip()
-    
+
         # Special handling for Christmas / holiday
         if any(key in g_lower for key in ["christmas", "xmas", "holiday"]):
             genre_text = (
@@ -147,13 +147,10 @@ async def generate_song_round(
                 f"\nYou MUST choose a song that clearly fits this genre or scene: {genre}."
                 "\nDo NOT choose songs from other genres."
             )
-    
 
     year_text = ""
     if year:
-        year_text = (
-            f"\nPrefer a song released around this year/era: {year}."
-        )
+        year_text = f"\nPrefer a song released around this year/era: {year}."
 
     # Songs we NEVER want again
     avoid_lines = [
@@ -212,6 +209,7 @@ Rules:
 - Do not include any explanation or text outside the JSON object.
 """
 
+    # First call
     resp = client_oa.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[{"role": "user", "content": prompt}],
@@ -219,19 +217,53 @@ Rules:
         max_tokens=400,
     )
 
-    text = (resp.choices[0].message.content or "").strip()
+    data = None
+    attempts_json = 0
 
-    # Strip ```json fences if the model adds them
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
+    # --- SAFE JSON PARSE / VALIDATION LOOP ---
+    while attempts_json < 5:
+        attempts_json += 1
 
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        print("[MicMate] Invalid JSON from model:", repr(e), "raw:", text[:200])
-        raise
+        text = (resp.choices[0].message.content or "").strip()
+
+        # Strip ```json fences if the model adds them
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:].strip()
+
+        try:
+            candidate = json.loads(text)
+        except Exception as e:
+            print("[MicMate] Invalid JSON from model, retrying:", repr(e))
+            resp = client_oa.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.9,
+                max_tokens=400,
+            )
+            continue
+
+        # Validate required fields: title + some lyric content
+        if not candidate.get("song_title") or not candidate.get("lyric_lines"):
+            print("[MicMate] Missing song_title or lyric_lines, retrying…")
+            resp = client_oa.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.9,
+                max_tokens=400,
+            )
+            continue
+
+        data = candidate
+        break
+
+    if data is None:
+        raise RuntimeError(
+            "Model failed to return valid song JSON after multiple attempts."
+        )
+
+    # ---- Normalisation & safety ----
 
     song_title = str(data.get("song_title", "")).strip()
     artist = str(data.get("artist", "")).strip()
@@ -277,7 +309,7 @@ Rules:
     acc_artist = [_norm(s) for s in norm_list(acc_artist)]
 
     if not song_title or not safe_lines:
-        print("[MicMate] Missing title/lyrics. Raw:", text[:200])
+        print("[MicMate] Missing title/lyrics after normalisation.")
         raise RuntimeError("Model response missing song_title or lyric_lines")
 
     return SongRound(
