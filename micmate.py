@@ -91,31 +91,36 @@ async def generate_song_round(
     last_song: Optional[SongRound] = None,
     used_titles: Optional[set] = None,
     genre: Optional[str] = None,
+    year: Optional[str] = None,
 ) -> SongRound:
-
     """
     Ask the model for a song with 1–3 short lyric lines and acceptable answers.
     No local fallback. If this fails, caller will stop the game.
     """
     if used_titles is None:
         used_titles = set()
-        
-        # Genre text for the prompt
-        genre_text = ""
-        if genre:
-            genre_text = (
-                f"\nYou MUST choose a song that clearly fits this genre or scene: {genre}."
-                "\nDo NOT choose songs from other genres."
-            )
 
-    
+    # Genre / year text for the prompt
+    genre_text = ""
+    if genre:
+        genre_text = (
+            f"\nYou MUST choose a song that clearly fits this genre or scene: {genre}."
+            "\nDo NOT choose songs from other genres."
+        )
+
+    year_text = ""
+    if year:
+        year_text = (
+            f"\nPrefer a song released around this year/era: {year}."
+        )
+
     # Songs we NEVER want again
     avoid_lines = [
         'You must not choose "Shape of You" by Ed Sheeran.',
         'You must not choose "Billie Jean" by Michael Jackson.',
     ]
 
-    # Tell the model which titles already appeared in this Mic game
+    # Tell the model which titles already appeared in this Karaoke game
     if used_titles:
         used_list = ", ".join(f'"{t}"' for t in used_titles)
         avoid_lines.append(
@@ -136,8 +141,7 @@ You are powering a Discord “guess the song” game using lyrics.
 
 Pick a well-known, globally recognisable song that many people are likely to know.
 {avoid_text}
-{genre_text}
-
+{genre_text}{year_text}
 
 Return ONLY a compact JSON object with this exact structure:
 
@@ -235,7 +239,6 @@ Rules:
     )
 
 # ------------- GAME LOGIC -------------
-
 async def play_single_level(
     channel: discord.TextChannel,
     level: int,
@@ -244,8 +247,8 @@ async def play_single_level(
     last_song: Optional[SongRound] = None,
     used_titles: Optional[set] = None,
     genre: Optional[str] = None,
+    year: Optional[str] = None,
 ) -> Tuple[Optional[int], Optional[SongRound], bool]:
-
     """
     Runs one level and returns (winner_id, song, passed_flag).
 
@@ -273,7 +276,12 @@ async def play_single_level(
         last_title_norm = _norm(last_song.song_title) if last_song else None
 
         while attempts < 10:  # a few extra tries
-            candidate = await generate_song_round(last_song, used_titles, genre, year)
+            candidate = await generate_song_round(
+                last_song=last_song,
+                used_titles=used_titles,
+                genre=genre,
+                year=year,
+            )
             attempts += 1
 
             title_key = _norm(candidate.song_title)
@@ -288,13 +296,11 @@ async def play_single_level(
             # even after retries, just take the last candidate
             song = candidate
 
-
-
     except Exception as e:
         print("[MicMate] Fatal error getting song:", repr(e))
         await channel.send(
             "⚠️ I couldn't load a new song just now, "
-            "so this Mic game has been stopped. Try `/mic` again in a bit."
+            "so this Karaoke game has been stopped. Try `/mic` again in a bit."
         )
         return None, None, False
 
@@ -344,9 +350,7 @@ async def play_single_level(
         if content.startswith("m.pass"):
             used = passes_used.get(channel.id, 0)
             if used >= 3:
-                await channel.send(
-                    "🚫 No passes left."
-                )
+                await channel.send("🚫 No passes left.")
                 continue
             passes_used[channel.id] = used + 1
             passed_flag = True
@@ -413,7 +417,6 @@ async def play_single_level(
 
     return winner_id, song, passed_flag
 
-
 async def show_ranking(
     channel: discord.TextChannel,
     scores: Dict[int, int],
@@ -472,7 +475,7 @@ async def run_mic_game(
     passes_used[channel.id] = 0
     current_song.pop(channel.id, None)
 
-    await channel.send("🎮 **Mic game starting!**")
+    await channel.send("🎮 **Karaoke game starting!**")
 
     try:
         for level in range(1, total_levels + 1):
@@ -527,7 +530,7 @@ async def run_mic_game(
 
     except Exception as e:
         print("[MicMate] Unexpected error in run_mic_game:", repr(e))
-        await channel.send("⚠️ Something went wrong and this Mic game had to stop.")
+        await channel.send("⚠️ Something went wrong and this Karaoke game had to stop.")
     finally:
         active_games.pop(channel.id, None)
         current_song.pop(channel.id, None)
@@ -539,7 +542,7 @@ async def run_mic_game(
 
 async def use_hint(channel: discord.TextChannel, user: discord.abc.User):
     if not active_games.get(channel.id, False):
-        await channel.send("There is no active Mic game in this channel.")
+        await channel.send("There is no active Karaoke game in this channel.")
         return
 
     song = current_song.get(channel.id)
@@ -576,7 +579,7 @@ async def hint_prefix(ctx: commands.Context):
 
 @bot.tree.command(
     name="mic_hint",
-    description="Use one of the shared hints in the current Mic game.",
+    description="Use one of the shared hints in the current Karaoke game.",
 )
 async def mic_hint_slash(interaction: discord.Interaction):
     channel = interaction.channel
@@ -605,7 +608,7 @@ async def mic_pass_slash(interaction: discord.Interaction):
 
     if not active_games.get(channel.id, False):
         await interaction.response.send_message(
-            "There is no active Mic game in this channel.",
+            "There is no active Karaoke game in this channel.",
             ephemeral=True,
         )
         return
@@ -613,7 +616,7 @@ async def mic_pass_slash(interaction: discord.Interaction):
     used = passes_used.get(channel.id, 0)
     if used >= 3:
         await interaction.response.send_message(
-            "No passes left for this Mic game (3/3 used).",
+            "No passes left for this Karaoke game (3/3 used).",
             ephemeral=True,
         )
         return
@@ -666,7 +669,7 @@ async def mic_slash(
 
     if active_games.get(channel.id, False):
         await interaction.response.send_message(
-            "There is already a Mic game running in this channel.",
+            "There is already a Karaoke game running in this channel.",
             ephemeral=True,
         )
         return
@@ -678,7 +681,7 @@ async def mic_slash(
         total_levels = 50
 
     await interaction.response.send_message(
-        f"Starting Mic game ...",
+        f"Starting Karaoke game ...",
         ephemeral=True,
     )
 
@@ -696,7 +699,7 @@ async def mic_prefix(ctx: commands.Context, rounds: Optional[int] = None):
 
     if active_games.get(channel.id, False):
         await ctx.reply(
-            "There is already a Mic game running in this channel.",
+            "There is already a Karaoke game running in this channel.",
             mention_author=False,
         )
         return
@@ -713,7 +716,7 @@ async def mic_prefix(ctx: commands.Context, rounds: Optional[int] = None):
         total_levels = 50
 
     await ctx.reply(
-        f"Starting Mic game with **{total_levels}** levels...",
+        f"Starting Karaoke game with **{total_levels}** levels...",
         mention_author=False,
     )
 
