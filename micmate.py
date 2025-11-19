@@ -269,7 +269,7 @@ async def play_single_level(
     lyrics_block = "\n".join(f"• “{line}”" for line in song.lyric_lines)
     desc = (
         f"**Lyrics:**\n{lyrics_block}\n\n"
-        "Mode: Guess the **TITLE** or **ARTIST** in chat.\n"
+        "Mode: Guess the **TITLE** or **ARTIST**.\n"
         f"You have **{ROUND_TIME} seconds**."
     )
 
@@ -310,7 +310,7 @@ async def play_single_level(
             used = passes_used.get(channel.id, 0)
             if used >= 3:
                 await channel.send(
-                    "🚫 No passes left for this Mic game (3/3 used)."
+                    "🚫 No passes left."
                 )
                 continue
             passes_used[channel.id] = used + 1
@@ -508,7 +508,7 @@ async def use_hint(channel: discord.TextChannel, user: discord.abc.User):
 
     used = hints_used.get(channel.id, 0)
     if used >= 3:
-        await channel.send("🚫 No hints left for this Mic game (3/3 used).")
+        await channel.send("🚫 No hints left.")
         return
 
     hints_used[channel.id] = used + 1
