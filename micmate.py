@@ -94,43 +94,44 @@ async def generate_song_round(
 
 # ------------- OPENAI -------------
 
-async def generate_song_round(last_song: Optional[SongRound] = None) -> SongRound:
+async def generate_song_round(
+    last_song: Optional[SongRound] = None,
+    used_titles: Optional[set] = None,
+) -> SongRound:
     """
     Ask the model for a song with 1–3 short lyric lines and acceptable answers.
     No local fallback. If this fails, caller will stop the game.
     """
-    avoid_text = """
-You must not choose "Shape of You" by Ed Sheeran.
-"""
     if used_titles is None:
         used_titles = set()
 
-    genre_text = ""
-    if genre:
-        genre_text = (
-            f"\nPrefer a song that fits this genre or style: {genre}."
+    # Songs we NEVER want again
+    avoid_lines = [
+        'You must not choose "Shape of You" by Ed Sheeran.',
+        'You must not choose "Billie Jean" by Michael Jackson.',
+    ]
+
+    # Tell the model which titles already appeared in this Mic game
+    if used_titles:
+        used_list = ", ".join(f'"{t}"' for t in used_titles)
+        avoid_lines.append(
+            f"You must not choose any of these titles already used in this game: {used_list}."
         )
 
-    year_text = ""
-    if year:
-        year_text = (
-            f"\nPrefer a song that was released around this year/era: {year}."
-        )
-    
-    
+    # And also don’t repeat the immediate previous round
     if last_song is not None:
-        avoid_text += f"""
-The previous round used: "{last_song.song_title}" by {last_song.artist}.
-You must not choose that same song again this round.
-"""
+        avoid_lines.append(
+            f'The previous round used: "{last_song.song_title}" by {last_song.artist}. '
+            "You must not choose that same song again this round."
+        )
+
+    avoid_text = "\n".join(avoid_lines)
 
     prompt = f"""
 You are powering a Discord “guess the song” game using lyrics.
 
 Pick a well-known, globally recognisable song that many people are likely to know.
 {avoid_text}
-{genre_text}
-{year_text}
 
 Return ONLY a compact JSON object with this exact structure:
 
@@ -164,6 +165,7 @@ Rules:
 
     text = (resp.choices[0].message.content or "").strip()
 
+    # Strip ```json fences if the model adds them
     if text.startswith("```"):
         text = text.strip("`")
         if text.lower().startswith("json"):
@@ -197,6 +199,8 @@ Rules:
         return out
 
     lyric_lines = norm_list(lyric_lines)[:3]
+
+    # Enforce the 8-words / 90-char limit
     safe_lines: List[str] = []
     total_chars = 0
     for line in lyric_lines:
@@ -223,7 +227,6 @@ Rules:
         acceptable_titles=acc_title,
         acceptable_artists=acc_artist,
     )
-
 
 # ------------- GAME LOGIC -------------
 
