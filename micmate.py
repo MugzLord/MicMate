@@ -46,7 +46,7 @@ class SongRound:
     lyric_lines: List[str]
     acceptable_titles: List[str]
     acceptable_artists: List[str]
-
+    hints: List[str] = field(default_factory=list)  # extra non-lyric hints
 
 # One active game per channel
 active_games: Dict[int, bool] = {}
@@ -87,6 +87,8 @@ def is_correct_guess(song: SongRound, guess: str) -> bool:
 
 # ------------- OPENAI -------------
 
+# ------------- OPENAI -------------
+
 async def generate_song_round(
     last_song: Optional[SongRound] = None,
     used_titles: Optional[set] = None,
@@ -94,7 +96,8 @@ async def generate_song_round(
     year: Optional[str] = None,
 ) -> SongRound:
     """
-    Ask the model for a song with 1–3 short lyric lines and acceptable answers.
+    Ask the model for a song with 1–3 short lyric lines,
+    some non-lyric hints, and acceptable answers.
     No local fallback. If this fails, caller will stop the game.
     """
     if used_titles is None:
@@ -120,7 +123,7 @@ async def generate_song_round(
         'You must not choose "Billie Jean" by Michael Jackson.',
     ]
 
-    # Tell the model which titles already appeared in this Karaoke game
+    # Tell the model which titles already appeared in this Mic game
     if used_titles:
         used_list = ", ".join(f'"{t}"' for t in used_titles)
         avoid_lines.append(
@@ -149,6 +152,7 @@ Return ONLY a compact JSON object with this exact structure:
   "song_title": "...",
   "artist": "...",
   "lyric_lines": ["...", "...", "..."],
+  "hints": ["...", "...", "..."],
   "acceptable_title_answers": ["...", "..."],
   "acceptable_artist_answers": ["...", "..."]
 }}
@@ -159,6 +163,10 @@ Rules:
   - The total characters across all lines must stay safely under 90 characters.
   - Do not output full verses or long passages.
 - It is OK if lines resemble real lyrics, as long as they stay under the above limits.
+- "hints" must contain 1 to 3 short hint lines that DO NOT quote the lyrics:
+  - focus on era, mood, theme, interesting facts about the artist,
+    word count of the title, first letter, country, etc.
+  - do not copy any of the lyric lines or quote them directly.
 - In "acceptable_title_answers":
   - include sensible variations of the song title (title alone, title + artist, common short forms).
 - In "acceptable_artist_answers":
@@ -190,11 +198,14 @@ Rules:
     song_title = str(data.get("song_title", "")).strip()
     artist = str(data.get("artist", "")).strip()
     lyric_lines = data.get("lyric_lines") or []
+    hints_raw = data.get("hints") or []
     acc_title = data.get("acceptable_title_answers") or []
     acc_artist = data.get("acceptable_artist_answers") or []
 
     if not isinstance(lyric_lines, list):
         lyric_lines = [str(lyric_lines)]
+    if not isinstance(hints_raw, list):
+        hints_raw = [str(hints_raw)]
     if not isinstance(acc_title, list):
         acc_title = [str(acc_title)]
     if not isinstance(acc_artist, list):
@@ -209,8 +220,9 @@ Rules:
         return out
 
     lyric_lines = norm_list(lyric_lines)[:3]
+    hints_list = norm_list(hints_raw)[:3]
 
-    # Enforce the 8-words / 90-char limit
+    # Enforce the 8-words / 90-char limit on lyrics only
     safe_lines: List[str] = []
     total_chars = 0
     for line in lyric_lines:
@@ -236,6 +248,7 @@ Rules:
         lyric_lines=safe_lines,
         acceptable_titles=acc_title,
         acceptable_artists=acc_artist,
+        hints=hints_list,
     )
 
 # ------------- GAME LOGIC -------------
@@ -338,11 +351,15 @@ async def play_single_level(
                 timeout=remaining,
                 check=lambda m: (
                     m.channel.id == channel.id
-                    and not m.author.bot
+                    and (
+                        not m.author.bot
+                        or m.content.startswith("m.pass")  # allow our synthetic pass message
+                    )
                 ),
             )
         except asyncio.TimeoutError:
             break
+
 
         content = msg.content.lower().strip()
 
@@ -461,13 +478,12 @@ async def run_mic_game(
     genre: Optional[str] = None,
     year: Optional[str] = None,
 ):
-
     """Main game loop for one Mic session in a channel."""
     active_games[channel.id] = True
     scores: Dict[int, int] = {}
     last_song: Optional[SongRound] = None
 
-    # 👉 add this line
+    # track used titles in this session
     used_titles: set[str] = set()
 
     # reset per-game counters
@@ -475,14 +491,15 @@ async def run_mic_game(
     passes_used[channel.id] = 0
     current_song.pop(channel.id, None)
 
-    await channel.send("🎮 **Karaoke game starting!**")
+    await channel.send("🎮 **Mic game starting!**")
+
+    level = 1
 
     try:
-        for level in range(1, total_levels + 1):
+        while True:
             if not active_games.get(channel.id, False):
                 break
 
-            # 👇 pass used_titles into play_single_level
             winner_id, this_song, passed_flag = await play_single_level(
                 channel,
                 level,
@@ -493,7 +510,6 @@ async def run_mic_game(
                 genre=genre,
                 year=year,
             )
-
 
             if this_song is None:
                 # error already messaged in channel
@@ -516,7 +532,9 @@ async def run_mic_game(
             # Winner or pass -> continue
             await asyncio.sleep(BREAK_TIME)
 
-            final_round = (level == total_levels)
+            # If total_levels == 0 => infinite mode (no cap)
+            final_round = (total_levels > 0 and level >= total_levels)
+
             await show_ranking(
                 channel,
                 scores,
@@ -525,18 +543,21 @@ async def run_mic_game(
                 final=final_round,
             )
 
-            if not final_round:
-                await asyncio.sleep(3)
+            if final_round:
+                # hit the requested max levels, end cleanly
+                break
+
+            await asyncio.sleep(3)
+            level += 1
 
     except Exception as e:
         print("[MicMate] Unexpected error in run_mic_game:", repr(e))
-        await channel.send("⚠️ Something went wrong and this Karaoke game had to stop.")
+        await channel.send("⚠️ Something went wrong and this Mic game had to stop.")
     finally:
         active_games.pop(channel.id, None)
         current_song.pop(channel.id, None)
         hints_used.pop(channel.id, None)
         passes_used.pop(channel.id, None)
-
 
 # ------------- HINT & PASS COMMANDS -------------
 
@@ -674,11 +695,16 @@ async def mic_slash(
         )
         return
 
-    total_levels = rounds or DEFAULT_ROUNDS
-    if total_levels < 1:
-        total_levels = 1
-    if total_levels > 50:
-        total_levels = 50
+    # If rounds is None -> 0 = infinite levels (until fail)
+    if rounds is None:
+        total_levels = 0
+    else:
+        total_levels = rounds
+        if total_levels < 1:
+            total_levels = 1
+        if total_levels > 50:
+            total_levels = 50
+
 
     await interaction.response.send_message(
         f"Starting Karaoke game ...",
@@ -704,24 +730,26 @@ async def mic_prefix(ctx: commands.Context, rounds: Optional[int] = None):
         )
         return
 
-    total_levels = rounds or DEFAULT_ROUNDS
-    try:
-        total_levels = int(total_levels)
-    except (TypeError, ValueError):
-        total_levels = DEFAULT_ROUNDS
+    # rounds None -> infinite (0). If user types a number, use it as a cap.
+    if rounds is None:
+        total_levels = 0
+    else:
+        try:
+            total_levels = int(rounds)
+        except (TypeError, ValueError):
+            total_levels = 0  # fallback to infinite
 
-    if total_levels < 1:
-        total_levels = 1
-    if total_levels > 50:
-        total_levels = 50
+        if total_levels < 1:
+            total_levels = 1
+        if total_levels > 50:
+            total_levels = 50
 
     await ctx.reply(
-        f"Starting Karaoke game with **{total_levels}** levels...",
+        "Starting Mic game ...",
         mention_author=False,
     )
 
     bot.loop.create_task(run_mic_game(channel, total_levels))
-
 
 # ------------- RUN -------------
 
