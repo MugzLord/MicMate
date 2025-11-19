@@ -85,18 +85,13 @@ def is_correct_guess(song: SongRound, guess: str) -> bool:
 
     return False
 
-async def generate_song_round(
-    last_song: Optional[SongRound] = None,
-    used_titles: Optional[set] = None,
-    genre: Optional[str] = None,
-    year: Optional[str] = None,
-) -> SongRound:
-
 # ------------- OPENAI -------------
 
 async def generate_song_round(
     last_song: Optional[SongRound] = None,
     used_titles: Optional[set] = None,
+    genre: Optional[str] = None,
+    year: Optional[str] = None,
 ) -> SongRound:
     """
     Ask the model for a song with 1–3 short lyric lines and acceptable answers.
