@@ -669,17 +669,14 @@ async def on_ready():
     description="Start a Mic lyrics guessing game."
 )
 @app_commands.describe(
-    rounds=f"How many levels to play (default {DEFAULT_ROUNDS})",
     genre="Optional genre (pop, rock, kpop, rnb, etc.)",
     year="Optional year or decade (e.g. 1980s, 90s, 2016)",
 )
 async def mic_slash(
     interaction: discord.Interaction,
-    rounds: Optional[int] = None,
     genre: Optional[str] = None,
     year: Optional[str] = None,
 ):
-
     channel = interaction.channel
     if not isinstance(channel, discord.TextChannel):
         await interaction.response.send_message(
@@ -690,28 +687,22 @@ async def mic_slash(
 
     if active_games.get(channel.id, False):
         await interaction.response.send_message(
-            "There is already a Karaoke game running in this channel.",
+            "There is already a Mic game running in this channel.",
             ephemeral=True,
         )
         return
 
-    # If rounds is None -> 0 = infinite levels (until fail)
-    if rounds is None:
-        total_levels = 0
-    else:
-        total_levels = rounds
-        if total_levels < 1:
-            total_levels = 1
-        if total_levels > 50:
-            total_levels = 50
-
+    # 0 = infinite levels (until someone fails / time runs out)
+    total_levels = 0
 
     await interaction.response.send_message(
-        f"Starting Karaoke game ...",
+        "Starting Mic game ...",
         ephemeral=True,
     )
 
-    bot.loop.create_task(run_mic_game(channel, total_levels, genre=genre, year=year))
+    bot.loop.create_task(
+        run_mic_game(channel, total_levels, genre=genre, year=year)
+    )
 
 @bot.command(name="mic")
 async def mic_prefix(ctx: commands.Context, rounds: Optional[int] = None):
