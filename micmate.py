@@ -91,15 +91,24 @@ async def generate_song_round(
     last_song: Optional[SongRound] = None,
     used_titles: Optional[set] = None,
     genre: Optional[str] = None,
-    year: Optional[str] = None,
 ) -> SongRound:
+
     """
     Ask the model for a song with 1–3 short lyric lines and acceptable answers.
     No local fallback. If this fails, caller will stop the game.
     """
     if used_titles is None:
         used_titles = set()
+        
+        # Genre text for the prompt
+        genre_text = ""
+        if genre:
+            genre_text = (
+                f"\nYou MUST choose a song that clearly fits this genre or scene: {genre}."
+                "\nDo NOT choose songs from other genres."
+            )
 
+    
     # Songs we NEVER want again
     avoid_lines = [
         'You must not choose "Shape of You" by Ed Sheeran.',
@@ -127,6 +136,8 @@ You are powering a Discord “guess the song” game using lyrics.
 
 Pick a well-known, globally recognisable song that many people are likely to know.
 {avoid_text}
+{genre_text}
+
 
 Return ONLY a compact JSON object with this exact structure:
 
@@ -233,8 +244,8 @@ async def play_single_level(
     last_song: Optional[SongRound] = None,
     used_titles: Optional[set] = None,
     genre: Optional[str] = None,
-    year: Optional[str] = None,
 ) -> Tuple[Optional[int], Optional[SongRound], bool]:
+
     """
     Runs one level and returns (winner_id, song, passed_flag).
 
