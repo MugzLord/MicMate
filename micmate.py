@@ -85,6 +85,12 @@ def is_correct_guess(song: SongRound, guess: str) -> bool:
 
     return False
 
+async def generate_song_round(
+    last_song: Optional[SongRound] = None,
+    used_titles: Optional[set] = None,
+    genre: Optional[str] = None,
+    year: Optional[str] = None,
+) -> SongRound:
 
 # ------------- OPENAI -------------
 
@@ -96,6 +102,22 @@ async def generate_song_round(last_song: Optional[SongRound] = None) -> SongRoun
     avoid_text = """
 You must not choose "Shape of You" by Ed Sheeran.
 """
+    if used_titles is None:
+        used_titles = set()
+
+    genre_text = ""
+    if genre:
+        genre_text = (
+            f"\nPrefer a song that fits this genre or style: {genre}."
+        )
+
+    year_text = ""
+    if year:
+        year_text = (
+            f"\nPrefer a song that was released around this year/era: {year}."
+        )
+    
+    
     if last_song is not None:
         avoid_text += f"""
 The previous round used: "{last_song.song_title}" by {last_song.artist}.
@@ -107,6 +129,8 @@ You are powering a Discord “guess the song” game using lyrics.
 
 Pick a well-known, globally recognisable song that many people are likely to know.
 {avoid_text}
+{genre_text}
+{year_text}
 
 Return ONLY a compact JSON object with this exact structure:
 
@@ -210,6 +234,8 @@ async def play_single_level(
     scores: Dict[int, int],
     last_song: Optional[SongRound] = None,
     used_titles: Optional[set] = None,
+    genre: Optional[str] = None,
+    year: Optional[str] = None,
 ) -> Tuple[Optional[int], Optional[SongRound], bool]:
     """
     Runs one level and returns (winner_id, song, passed_flag).
@@ -238,7 +264,7 @@ async def play_single_level(
         last_title_norm = _norm(last_song.song_title) if last_song else None
 
         while attempts < 10:  # a few extra tries
-            candidate = await generate_song_round(last_song)
+            candidate = await generate_song_round(last_song, used_titles, genre, year)
             attempts += 1
 
             title_key = _norm(candidate.song_title)
@@ -420,7 +446,10 @@ async def show_ranking(
 async def run_mic_game(
     channel: discord.TextChannel,
     total_levels: int,
+    genre: Optional[str] = None,
+    year: Optional[str] = None,
 ):
+
     """Main game loop for one Mic session in a channel."""
     active_games[channel.id] = True
     scores: Dict[int, int] = {}
@@ -449,7 +478,10 @@ async def run_mic_game(
                 scores,
                 last_song=last_song,
                 used_titles=used_titles,
+                genre=genre,
+                year=year,
             )
+
 
             if this_song is None:
                 # error already messaged in channel
@@ -604,12 +636,17 @@ async def on_ready():
     description="Start a Mic lyrics guessing game."
 )
 @app_commands.describe(
-    rounds=f"How many levels to play (default {DEFAULT_ROUNDS})"
+    rounds=f"How many levels to play (default {DEFAULT_ROUNDS})",
+    genre="Optional genre (pop, rock, kpop, rnb, etc.)",
+    year="Optional year or decade (e.g. 1980s, 90s, 2016)",
 )
 async def mic_slash(
     interaction: discord.Interaction,
     rounds: Optional[int] = None,
+    genre: Optional[str] = None,
+    year: Optional[str] = None,
 ):
+
     channel = interaction.channel
     if not isinstance(channel, discord.TextChannel):
         await interaction.response.send_message(
@@ -636,7 +673,7 @@ async def mic_slash(
         ephemeral=True,
     )
 
-    bot.loop.create_task(run_mic_game(channel, total_levels))
+    bot.loop.create_task(run_mic_game(channel, total_levels, genre=genre, year=year))
 
 @bot.command(name="mic")
 async def mic_prefix(ctx: commands.Context, rounds: Optional[int] = None):
