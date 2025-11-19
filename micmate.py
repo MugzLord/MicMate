@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
+import difflib
+
 
 import discord
 from discord.ext import commands
@@ -70,21 +72,47 @@ def is_correct_guess(song: SongRound, guess: str) -> bool:
     title_norm = _norm(song.song_title)
     artist_norm = _norm(song.artist)
 
+    # 1) Direct exact matches against acceptable lists
     for ans in song.acceptable_titles:
         if g == _norm(ans):
             return True
-    if title_norm and title_norm in g:
-        return True
-
     for ans in song.acceptable_artists:
         if g == _norm(ans):
             return True
-    if artist_norm and artist_norm in g:
+
+    # 2) Simple containment checks
+    if title_norm and (title_norm in g or g in title_norm):
+        return True
+    if artist_norm and (artist_norm in g or g in artist_norm):
         return True
 
-    return False
+    # 3) Fuzzy similarity (handles things like "u" vs "you", small typos, etc.)
+    def _similar(a: str, b: str) -> float:
+        return difflib.SequenceMatcher(None, a, b).ratio()
 
-# ------------- OPENAI -------------
+    # Check similarity with title
+    if title_norm:
+        if _similar(g, title_norm) >= 0.85:
+            return True
+
+    # Check similarity with each acceptable title variant
+    for ans in song.acceptable_titles:
+        ans_norm = _norm(ans)
+        if ans_norm and _similar(g, ans_norm) >= 0.85:
+            return True
+
+    # Check similarity with artist
+    if artist_norm:
+        if _similar(g, artist_norm) >= 0.85:
+            return True
+
+    # And each acceptable artist variant
+    for ans in song.acceptable_artists:
+        ans_norm = _norm(ans)
+        if ans_norm and _similar(g, ans_norm) >= 0.85:
+            return True
+
+    return False
 
 # ------------- OPENAI -------------
 
