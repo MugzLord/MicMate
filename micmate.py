@@ -65,6 +65,7 @@ def _norm(s: str) -> str:
 
 
 def is_correct_guess(song: SongRound, guess: str) -> bool:
+    """Stricter matching: must match title/artist, not just contain a word."""
     g = _norm(guess)
     if not g:
         return False
@@ -72,46 +73,20 @@ def is_correct_guess(song: SongRound, guess: str) -> bool:
     title_norm = _norm(song.song_title)
     artist_norm = _norm(song.artist)
 
-    # 1) Direct exact matches against acceptable lists
-    for ans in song.acceptable_titles:
-        if g == _norm(ans):
-            return True
-    for ans in song.acceptable_artists:
-        if g == _norm(ans):
-            return True
-
-    # 2) Simple containment checks
-    if title_norm and (title_norm in g or g in title_norm):
-        return True
-    if artist_norm and (artist_norm in g or g in artist_norm):
+    # 1) Exact match against acceptable variations returned by the model
+    if g in song.acceptable_titles or g in song.acceptable_artists:
         return True
 
-    # 3) Fuzzy similarity (handles things like "u" vs "you", small typos, etc.)
-    def _similar(a: str, b: str) -> float:
-        return difflib.SequenceMatcher(None, a, b).ratio()
+    # 2) Exact match to full title or full artist
+    if g == title_norm or g == artist_norm:
+        return True
 
-    # Check similarity with title
-    if title_norm:
-        if _similar(g, title_norm) >= 0.85:
-            return True
+    # 3) Allow messages that contain BOTH full title and full artist
+    #    e.g. "all i want for christmas is you mariah carey"
+    if title_norm and artist_norm and title_norm in g and artist_norm in g:
+        return True
 
-    # Check similarity with each acceptable title variant
-    for ans in song.acceptable_titles:
-        ans_norm = _norm(ans)
-        if ans_norm and _similar(g, ans_norm) >= 0.85:
-            return True
-
-    # Check similarity with artist
-    if artist_norm:
-        if _similar(g, artist_norm) >= 0.85:
-            return True
-
-    # And each acceptable artist variant
-    for ans in song.acceptable_artists:
-        ans_norm = _norm(ans)
-        if ans_norm and _similar(g, ans_norm) >= 0.85:
-            return True
-
+    # No more substring-only matches like just "christmas" or "mariah"
     return False
 
 # ------------- OPENAI -------------
@@ -152,11 +127,31 @@ async def generate_song_round(
     if year:
         year_text = f"\nPrefer a song released around this year/era: {year}."
 
-    # Songs we NEVER want again
+
+    # Songs we NEVER want again (global)
     avoid_lines = [
         'You must not choose "Shape of You" by Ed Sheeran.',
         'You must not choose "Billie Jean" by Michael Jackson.',
     ]
+
+    # Extra: if this is a Christmas / holiday genre, avoid the super overused ones
+    if genre and any(k in genre.lower() for k in ["christmas", "xmas", "holiday"]):
+        avoid_christmas_titles = [
+            "All I Want for Christmas Is You",
+            "Last Christmas",
+            "Jingle Bells",
+            "Jingle Bell Rock",
+            "Rockin' Around the Christmas Tree",
+            "Feliz Navidad",
+            "Santa Tell Me",
+            "It's Beginning to Look a Lot Like Christmas",
+        ]
+        avoid_lines.append(
+            "You must not choose any of these very common Christmas songs; "
+            "instead, pick other well-known festive songs that people still recognise: "
+            + ", ".join(f'"{t}"' for t in avoid_christmas_titles)
+            + ". This is a hard rule."
+        )
 
     # Tell the model which titles already appeared in this Mic game
     if used_titles:
@@ -358,7 +353,7 @@ async def play_single_level(
         attempts = 0
         last_title_norm = _norm(last_song.song_title) if last_song else None
 
-        while attempts < 10:  # a few extra tries
+        while attempts < 25:  # a few extra tries
             candidate = await generate_song_round(
                 last_song=last_song,
                 used_titles=used_titles,
@@ -464,6 +459,7 @@ async def play_single_level(
             title="✅ Answer guessed!",
             description=(
                 f"**Song:** {song.song_title} – {song.artist}\n"
+                 "\n"  # <-- added blank line
                 f"**Winner:** <@{winner_id}>\n\n"
                 f"Next song in **{BREAK_TIME} seconds**..."
             ),
