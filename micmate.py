@@ -991,25 +991,21 @@ def _build_doodle_prompt(word: str) -> str:
 
 def generate_doodle_image_sync(word: str) -> bytes:
     """
-    Blocking call to OpenAI image API.
-    Runs in a thread via asyncio.to_thread().
-    Returns raw PNG bytes.
-    Uses the gpt-image-1 model (which your account supports).
+    Generates a doodle image. Internal only — nothing shown to users.
     """
     prompt = _build_doodle_prompt(word)
-    print("[MicMate-Doodle] Generating image with gpt-image-1")
+    print("[MicMate-Doodle] Generating doodle...")
 
     img = client_oa.images.generate(
-        model="gpt-image-1",
+        model="gpt-image-1",  # internal only, not sent to Discord
         prompt=prompt,
-        size="512x512",
+        size="256x256",
     )
 
-    # If this fails for any reason, the exception will bubble up
-    # to start_doodle_round where we already catch and show it.
     b64_data = img.data[0].b64_json
     image_bytes = base64.b64decode(b64_data)
-    print("[MicMate-Doodle] Image generation OK.")
+
+    print("[MicMate-Doodle] Image generation succeeded.")
     return image_bytes
 
 
@@ -1041,14 +1037,18 @@ async def start_doodle_round(channel: discord.TextChannel):
         await channel.send("⚠️ I couldn't think of a doodle idea this time. Try again in a bit.")
         return
 
-  
+
     # 2) Generate the doodle image from OpenAI (images)
     try:
         image_bytes = await asyncio.to_thread(generate_doodle_image_sync, word)
     except Exception as e:
+        # Detailed log ONLY in console
         print("[MicMate-Doodle] Error generating doodle image:", repr(e))
-        await channel.send(f"⚠️ Doodle failed: `{e}`")
+    
+        # Safe message for Discord
+        await channel.send("⚠️ Couldn’t draw a doodle right now — try again in a moment.")
         return
+
 
 
     file = discord.File(io.BytesIO(image_bytes), filename="doodle.png")
