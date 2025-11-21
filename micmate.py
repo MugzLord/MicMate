@@ -994,19 +994,34 @@ def generate_doodle_image_sync(word: str) -> bytes:
     Blocking call to OpenAI image API.
     Runs in a thread via asyncio.to_thread().
     Returns raw PNG bytes.
+
+    Tries gpt-image-1 first, then gpt-image-latest,
+    and logs whatever error we get.
     """
     prompt = _build_doodle_prompt(word)
+    last_exc: Optional[Exception] = None
 
-    img = client_oa.images.generate(
-        model="gpt-image-1",
-        prompt=prompt,
-        size="512x512",
-        n=1,
-    )
+    for model_name in ("gpt-image-1", "gpt-image-latest"):
+        try:
+            print(f"[MicMate-Doodle] Trying image model: {model_name}")
+            img = client_oa.images.generate(
+                model=model_name,
+                prompt=prompt,
+                size="512x512",
+            )
+            b64_data = img.data[0].b64_json
+            image_bytes = base64.b64decode(b64_data)
+            print("[MicMate-Doodle] Image generation OK.")
+            return image_bytes
+        except Exception as e:
+            print(f"[MicMate-Doodle] Error with model {model_name}:", repr(e))
+            last_exc = e
 
-    b64_data = img.data[0].b64_json
-    image_bytes = base64.b64decode(b64_data)
-    return image_bytes
+    # if both models failed, raise the last error so the caller can show it
+    if last_exc is not None:
+        raise last_exc
+
+    raise RuntimeError("Unknown error in generate_doodle_image_sync")
 
 
 async def start_doodle_round(channel: discord.TextChannel):
@@ -1038,8 +1053,10 @@ async def start_doodle_round(channel: discord.TextChannel):
     try:
         image_bytes = await asyncio.to_thread(generate_doodle_image_sync, word)
     except Exception as e:
+        # This will show the REAL error in logs and in Discord once,
+        # instead of the generic message.
         print("[MicMate-Doodle] Error generating doodle image:", repr(e))
-        await channel.send("⚠️ I couldn't draw a doodle this time. Try again in a bit.")
+        await channel.send(f"⚠️ Doodle failed: `{e}`")
         return
 
     file = discord.File(io.BytesIO(image_bytes), filename="doodle.png")
