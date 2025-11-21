@@ -12,7 +12,6 @@ from discord.ext import commands
 from discord import app_commands
 
 from openai import OpenAI
-from PIL import Image
 
 # ------------- CONFIG -------------
 
