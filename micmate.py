@@ -15,6 +15,7 @@ from discord.ext import commands
 from discord import app_commands
 
 from openai import OpenAI
+from PIL import Image
 
 # ------------- CONFIG -------------
 
@@ -991,23 +992,39 @@ def _build_doodle_prompt(word: str) -> str:
 
 def generate_doodle_image_sync(word: str) -> bytes:
     """
-    Generates a doodle image. Internal only — nothing shown to users.
+    Generates a doodle image using gpt-image-1-mini at 1024x1024,
+    then shrinks it (e.g. to 512x512) before sending to Discord.
     """
     prompt = _build_doodle_prompt(word)
     print("[MicMate-Doodle] Generating doodle...")
 
+    # Call OpenAI – must use one of the allowed sizes
     img = client_oa.images.generate(
-        model="gpt-image-1",  # internal only, not sent to Discord
+        model="gpt-image-1-mini",  # cheaper than gpt-image-1
         prompt=prompt,
-        size="256x256",
+        size="1024x1024",          # required by API for this model
     )
 
+    # Decode base64 from OpenAI
     b64_data = img.data[0].b64_json
-    image_bytes = base64.b64decode(b64_data)
+    original_bytes = base64.b64decode(b64_data)
 
-    print("[MicMate-Doodle] Image generation succeeded.")
-    return image_bytes
+    # Downscale locally so the image in Discord isn't huge
+    original_file = io.BytesIO(original_bytes)
+    im = Image.open(original_file)
 
+    # Pick whatever you like here: 512x512, 384x384, etc.
+    target_size = (512, 512)
+    im = im.resize(target_size, Image.LANCZOS)
+
+    # Re-encode to PNG
+    out_buf = io.BytesIO()
+    im.save(out_buf, format="PNG")
+    out_buf.seek(0)
+
+    final_bytes = out_buf.read()
+    print("[MicMate-Doodle] Image generation + resize OK.")
+    return final_bytes
 
     raise RuntimeError("Unknown error in generate_doodle_image_sync")
 
